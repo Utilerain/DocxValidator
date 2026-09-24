@@ -32,7 +32,8 @@ if __name__ == "__main__":
         PageNumberingRule(),
         TitlePageRule(),
         SectionFormatRule(),
-        SectionPageFillRule()
+        SectionPageFillRule(),
+        ReferencesListRule()
     ])
     docx_path = Path(args.input_file)
     report = validator.validate(str(docx_path.absolute()))
@@ -42,6 +43,7 @@ if __name__ == "__main__":
 
     print_color(f"Найдено нарушений: {len(report)}\n", Fore.RED)
     for item in report:
-        print_color(f"[{item.severity.value}] {item.rule_name} | {item.location}", Fore.RED)
+        print_color(f"[{item.severity.value}] {item.rule_name} | {item.location}", Fore.RED if item.severity.value == "ERR" else Fore.YELLOW)
         print(f"    -> {item.message}")
+    print_color("Внимание! Программа может ошибаться в поиске ошибок в формате документа! Если вы считаете, что нарушения ошибочны, то можете спокойно игнорировать", Fore.CYAN)
     __import__("sys").exit(1)
