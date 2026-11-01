@@ -2267,3 +2267,191 @@ class FormulasRule(BaseRule):
             )
 
         return violations
+
+class ListsFormatRule(BaseRule):
+    DASH_ITEM_REGEX = re.compile(r'^(–|-|—)\s*(.+)$')
+    BRACKET_ITEM_REGEX = re.compile(r'^(\d+)\)\s*(.+)$')
+    DOT_ITEM_REGEX = re.compile(r'^(\d+)\.\s+(.+)$')
+
+    INDENT_TOLERANCE_CM = 0.15
+
+    @staticmethod
+    def _item_kind(text: str):
+        """Тип пункта списка: 'dot', 'bracket', 'dash' или None."""
+        if ListsFormatRule.DOT_ITEM_REGEX.match(text):
+            return 'dot'
+        if ListsFormatRule.BRACKET_ITEM_REGEX.match(text):
+            return 'bracket'
+        if ListsFormatRule.DASH_ITEM_REGEX.match(text):
+            return 'dash'
+        return None
+
+    def _get_effective_left_indent(self, paragraph):
+        indent = paragraph.paragraph_format.left_indent
+        if indent is None and paragraph.style and paragraph.style.paragraph_format:
+            indent = paragraph.style.paragraph_format.left_indent
+        return indent
+
+    def _get_effective_first_indent(self, paragraph):
+        indent = paragraph.paragraph_format.first_line_indent
+        if indent is None and paragraph.style and paragraph.style.paragraph_format:
+            indent = paragraph.style.paragraph_format.first_line_indent
+        return indent
+
+    def _check_item(self, paragraphs, idx, kind, is_last, violations):
+        rule_name = "ListsFormatRule"
+        paragraph = paragraphs[idx]
+        text = paragraph.text.strip()
+        loc = f"Абзац {idx + 1} ('{text[:30]}...')"
+
+        if kind == 'dot':
+            match = self.DOT_ITEM_REGEX.match(text)
+            number = int(match.group(1))
+            body = match.group(2)
+            expected_indent = 2.0 if number >= 10 else 1.75
+        elif kind == 'bracket':
+            match = self.BRACKET_ITEM_REGEX.match(text)
+            body = match.group(2)
+            expected_indent = 1.75
+        else:
+            body = self.DASH_ITEM_REGEX.match(text).group(2)
+            expected_indent = 1.75
+
+        # 1. Регистр первой буквы после маркера
+        first_char = body[:1]
+        if first_char.isalpha():
+            if kind in ('dash', 'bracket') and first_char.isupper():
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.WARNING,
+                        location=loc,
+                        message=f"После {'тире' if kind == 'dash' else 'скобки'} список пишется с маленькой буквы."
+                    )
+                )
+            if kind == 'dot' and first_char.islower():
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.WARNING,
+                        location=loc,
+                        message="После точки список пишется с большой буквы."
+                    )
+                )
+
+        # 2. Знак в конце пункта
+        last_char = text[-1:]
+        if kind == 'dot':
+            if last_char not in ('.',):
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.WARNING,
+                        location=loc,
+                        message="В нумерованном списке с точкой в конце пункта всегда ставится точка."
+                    )
+                )
+        elif is_last:
+            if last_char not in ('.', ':'):
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.WARNING,
+                        location=loc,
+                        message="В последнем пункте списка ставится точка."
+                    )
+                )
+        else:
+            if last_char not in (';',):
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.WARNING,
+                        location=loc,
+                        message=f"Пункты {'маркированного' if kind == 'dash' else 'нумерованного'} списка "
+                                f"заканчиваются точкой с запятой (кроме последнего)."
+                    )
+                )
+
+        # 3. Отступ текста списка
+        left = self._get_effective_left_indent(paragraph)
+        first = self._get_effective_first_indent(paragraph)
+        left_cm = left.cm if left is not None else None
+        first_cm = first.cm if first is not None else None
+
+        indent_values = [v for v in (left_cm, first_cm) if v is not None]
+        if left_cm is not None and first_cm is not None:
+            indent_values.append(left_cm + first_cm)
+        if not any(abs(v - expected_indent) <= self.INDENT_TOLERANCE_CM for v in indent_values):
+            violations.append(
+                Violation(
+                    rule_name=rule_name,
+                    severity=Severity.WARNING,
+                    location=loc,
+                    message=f"Отступ текста списка должен составлять {expected_indent} см "
+                            f"(фактически: левый {round(left_cm, 2) if left_cm is not None else '—'} см, "
+                            f"красная строка {round(first_cm, 2) if first_cm is not None else '—'} см)."
+                )
+            )
+
+    def check(self, doc: Document) -> List[Violation]:
+        violations: List[Violation] = []
+        rule_name = "ListsFormatRule"
+
+        paragraphs = classify_paragraphs(doc)
+
+        def is_centered(p):
+            align = p.alignment
+            if align is None and p.style and p.style.paragraph_format:
+                align = p.style.paragraph_format.alignment
+            return align == WD_ALIGN_PARAGRAPH.CENTER
+
+        item_indices = set()
+        for idx, p in enumerate(paragraphs):
+            if getattr(p, 'is_title_page', False) or getattr(p, 'is_toc', False):
+                continue
+            text = p.text.strip()
+            if not text:
+                continue
+            # Список литературы и приложения не проверяются как списки
+            if re.match(r'^(СПИСОК\s+(ИСТОЧНИКОВ|ЛИТЕРАТУРЫ|ИСПОЛЬЗОВАННЫХ\s+ИСТОЧНИКОВ)|ПРИЛОЖЕНИЕ)', text.upper()):
+                break
+            if is_centered(p):
+                continue
+            if self._item_kind(text):
+                item_indices.add(idx)
+
+        for idx in sorted(item_indices):
+            paragraph = paragraphs[idx]
+            text = paragraph.text.strip()
+            kind = self._item_kind(text)
+            loc = f"Абзац {idx + 1} ('{text[:30]}...')"
+
+            # Соседний предыдущий/следующий пункт того же списка (пустые строки не считаются)
+            prev_item_idx = idx - 1
+            while prev_item_idx >= 0 and not paragraphs[prev_item_idx].text.strip():
+                prev_item_idx -= 1
+            next_item_idx = idx + 1
+            while next_item_idx < len(paragraphs) and not paragraphs[next_item_idx].text.strip():
+                next_item_idx += 1
+
+            has_prev_same = prev_item_idx in item_indices and self._item_kind(paragraphs[prev_item_idx].text.strip()) == kind
+            has_next_same = next_item_idx in item_indices and self._item_kind(paragraphs[next_item_idx].text.strip()) == kind
+            is_last = not has_next_same
+
+            self._check_item(paragraphs, idx, kind, is_last, violations)
+
+            # 4. Двоеточие в абзаце перед первым пунктом списка (из двух и более пунктов)
+            if not has_prev_same and has_next_same and prev_item_idx >= 0:
+                prev_text = paragraphs[prev_item_idx].text.strip()
+                if not prev_text.endswith(':'):
+                    violations.append(
+                        Violation(
+                            rule_name=rule_name,
+                            severity=Severity.WARNING,
+                            location=loc,
+                            message="В абзаце перед списком ставится двоеточие."
+                        )
+                    )
+
+        return violations
