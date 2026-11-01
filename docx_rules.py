@@ -1550,3 +1550,134 @@ class SourceReferencesRule(BaseRule):
                     )
 
         return violations
+
+class AppendixFormatRule(BaseRule):
+    HEADER_REGEX = r'^ПРИЛОЖЕНИЕ'
+
+    @staticmethod
+    def _get_paragraph_section_indices(doc: Document) -> List[int]:
+        """Индекс секции для каждого абзаца doc.paragraphs (секции разделяются sectPr внутри абзаца)."""
+        mapping = []
+        current = 0
+        for child in doc.element.body.iterchildren():
+            if child.tag == qn('w:p'):
+                mapping.append(current)
+                pPr = child.find(qn('w:pPr'))
+                if pPr is not None and pPr.find(qn('w:sectPr')) is not None:
+                    current += 1
+        return mapping
+
+    def _has_page_number_field(self, header) -> bool:
+        xml_str = header._element.xml
+        return ("instrText" in xml_str and "PAGE" in xml_str) or ("w:fldSimple" in xml_str and "PAGE" in xml_str)
+
+    def _get_effective_font_size(self, run, paragraph) -> Optional[float]:
+        if run.font.size:
+            return run.font.size.pt
+        if paragraph.style and paragraph.style.font and paragraph.style.font.size:
+            return paragraph.style.font.size.pt
+        return None
+
+    def check(self, doc: Document) -> List[Violation]:
+        violations: List[Violation] = []
+        rule_name = "AppendixFormatRule"
+
+        paragraphs = classify_paragraphs(doc)
+
+        appendix_idx = None
+        for idx, paragraph in enumerate(paragraphs):
+            text = paragraph.text.strip()
+            if getattr(paragraph, 'is_title_page', False) or getattr(paragraph, 'is_toc', False):
+                continue
+            if re.match(self.HEADER_REGEX, text.upper()):
+                appendix_idx = idx
+                break
+
+        if appendix_idx is None:
+            return violations  # Приложения в документе нет
+
+        header_para = paragraphs[appendix_idx]
+        header_text = header_para.text.strip()[:30]
+        loc = f"Приложение (абзац {appendix_idx + 1}: '{header_text}')"
+
+        # 1. Заголовок выравнивается по правому краю
+        align = header_para.alignment
+        if align is None and header_para.style and header_para.style.paragraph_format:
+            align = header_para.style.paragraph_format.alignment
+        if align != WD_ALIGN_PARAGRAPH.RIGHT:
+            violations.append(
+                Violation(
+                    rule_name=rule_name,
+                    severity=Severity.ERROR,
+                    location=loc,
+                    message="Заголовок приложения должен быть выровнен по правому краю."
+                )
+            )
+
+        is_bold = any(run.bold for run in header_para.runs if run.text.strip())
+        if not is_bold and header_para.style and header_para.style.font:
+            is_bold = header_para.style.font.bold or False
+        if not is_bold:
+            violations.append(
+                Violation(
+                    rule_name=rule_name,
+                    severity=Severity.WARNING,
+                    location=loc,
+                    message="Заголовок приложения должен быть выделен полужирным шрифтом."
+                )
+            )
+
+        # 2. В приложении шрифт 12 пт и межстрочный интервал 1
+        for offset, paragraph in enumerate(paragraphs[appendix_idx + 1:], start=appendix_idx + 1):
+            text = paragraph.text.strip()
+            if not text:
+                continue
+
+            p_loc = f"Приложение (абзац {offset + 1}: '{text[:30]}...')"
+
+            for r_idx, run in enumerate(paragraph.runs, start=1):
+                if not run.text.strip():
+                    continue
+                font_size = self._get_effective_font_size(run, paragraph)
+                if font_size and abs(font_size - 12.0) > 0.1:
+                    violations.append(
+                        Violation(
+                            rule_name=rule_name,
+                            severity=Severity.WARNING,
+                            location=f"{p_loc}, фрагмент {r_idx}",
+                            message=f"Размер шрифта в приложении {font_size} pt, а допустим 12 pt."
+                        )
+                    )
+
+            line_sp = paragraph.paragraph_format.line_spacing
+            if line_sp is None and paragraph.style and paragraph.style.paragraph_format:
+                line_sp = paragraph.style.paragraph_format.line_spacing
+            if line_sp is not None and abs(float(line_sp) - 1.0) > 0.05:
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.WARNING,
+                        location=p_loc,
+                        message=f"Междустрочный интервал в приложении {line_sp}, а должен быть 1."
+                    )
+                )
+
+        # 3. Страницы приложения не нумеруются
+        section_indices = self._get_paragraph_section_indices(doc)
+        if appendix_idx < len(section_indices):
+            appendix_section = section_indices[appendix_idx]
+            if appendix_section > 0:  # Если приложение в первой секции — отделить нумерацию нельзя
+                for sec_idx, section in enumerate(doc.sections):
+                    if sec_idx < appendix_section:
+                        continue
+                    if self._has_page_number_field(section.header):
+                        violations.append(
+                            Violation(
+                                rule_name=rule_name,
+                                severity=Severity.ERROR,
+                                location=f"Секция {sec_idx + 1} (Верхний колонтитул)",
+                                message="В приложении страницы не должны нумероваться."
+                            )
+                        )
+
+        return violations
