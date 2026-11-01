@@ -33,7 +33,16 @@ if __name__ == "__main__":
         TitlePageRule(),
         SectionFormatRule(),
         SectionPageFillRule(),
-        ReferencesListRule()
+        ReferencesListRule(),
+        IntroductionContentRule(),
+        ParagraphConclusionRule(),
+        SourceReferencesRule(),
+        AppendixFormatRule(),
+        FiguresRule(),
+        TablesFormatRule(),
+        FormulasRule(),
+        ListsFormatRule(),
+        DashesRule()
     ])
     docx_path = Path(args.input_file)
     report = validator.validate(str(docx_path.absolute()))
