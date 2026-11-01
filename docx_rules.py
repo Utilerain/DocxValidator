@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from docx import Document
+from docx.oxml.ns import qn
 from docx.shared import Inches, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from enum import Enum
@@ -26,19 +27,24 @@ class BaseRule:
 def is_toc_line(text: str) -> bool:
     """
     Проверяет, является ли строка элементом оглавления
-    (содержит табуляцию с точками и номер страницы в конце).
+    (номер страницы в конце отделяется табуляцией или точками-заполнителями).
     """
-    return bool(re.search(r'[\t\.\s]+\d+\s*$', text))
+    return bool(re.search(r'(\t|\.{2,}|…)\s*\d+\s*$', text))
 
-def classify_paragraphs(doc: Document):
+def classify_paragraphs(doc: Document) -> List:
     """
     Размечает абзацы по типам, чтобы не натравливать MainTextFormatRule
     и другие правила на титульный лист и строки Содержания.
+
+    Возвращает список размеченных абзацев: python-docx пересоздаёт обёртки
+    Paragraph при каждом обращении к doc.paragraphs, поэтому флаги,
+    выставленные на обёртках из другого списка, теряются.
     """
+    classified = list(doc.paragraphs)
     in_title_page = True
     in_toc = False
 
-    for p in doc.paragraphs:
+    for p in classified:
         text = p.text.strip()
 
         # Определение начала оглавления (конец титульного листа)
@@ -56,6 +62,8 @@ def classify_paragraphs(doc: Document):
 
         p.is_title_page = in_title_page
         p.is_toc = in_toc or is_toc_line(text)
+
+    return classified
 
 class PageMarginsRule(BaseRule):
     def __init__(self, top=2.0, bottom=2.0, left=3.0, right=1.5):
@@ -128,9 +136,9 @@ class MainTextFormatRule(BaseRule):
         violations: List[Violation] = []
         rule_name = "MainTextFormatRule"
 
-        classify_paragraphs(doc)
+        paragraphs = classify_paragraphs(doc)
 
-        for p_idx, paragraph in enumerate(doc.paragraphs, start=1):
+        for p_idx, paragraph in enumerate(paragraphs, start=1):
             if getattr(paragraph, 'is_title_page', False) or getattr(paragraph, 'is_toc', False):
                 continue  # Пропускаем титульный лист и оглавление
 
@@ -764,16 +772,16 @@ class SectionFormatRule(BaseRule):
             indent = paragraph.style.paragraph_format.first_line_indent
         return indent is not None and indent.cm > 0.05
 
-    def _has_page_break_before(self, doc: Document, idx: int) -> bool:
+    def _has_page_break_before(self, paragraphs: List, idx: int) -> bool:
         if idx == 0:
             return True
 
-        p = doc.paragraphs[idx]
+        p = paragraphs[idx]
 
         if p.paragraph_format.page_break_before:
             return True
 
-        prev_p = doc.paragraphs[idx - 1]
+        prev_p = paragraphs[idx - 1]
         xml_str = prev_p._element.xml
         if 'w:br' in xml_str and 'w:type="page"' in xml_str:
             return True
@@ -787,8 +795,7 @@ class SectionFormatRule(BaseRule):
         violations: List[Violation] = []
         rule_name = "SectionFormatRule"
 
-        classify_paragraphs(doc)
-        paragraphs = doc.paragraphs
+        paragraphs = classify_paragraphs(doc)
 
         for idx, p in enumerate(paragraphs):
             text = p.text.strip()
@@ -854,7 +861,7 @@ class SectionFormatRule(BaseRule):
                     )
 
             # 4. Проверка правила «с новой страницы»
-            starts_new_page = self._has_page_break_before(doc, idx)
+            starts_new_page = self._has_page_break_before(paragraphs, idx)
             if is_major and not starts_new_page:
                 violations.append(
                     Violation(
@@ -953,8 +960,7 @@ class SectionPageFillRule(BaseRule):
         violations: List[Violation] = []
         rule_name = "SectionPageFillRule"
 
-        classify_paragraphs(doc)
-        paragraphs = doc.paragraphs
+        paragraphs = classify_paragraphs(doc)
 
         section_blocks = []
         current_block = []
@@ -1191,7 +1197,7 @@ class IntroductionContentRule(BaseRule):
         classify_paragraphs(doc)
 
         intro_start = None
-        for idx, p in enumerate(doc.paragraphs):
+        for idx, p in enumerate(classify_paragraphs(doc)):
             text = p.text.strip()
             if getattr(p, 'is_title_page', False) or getattr(p, 'is_toc', False) or is_toc_line(text):
                 continue
@@ -1237,6 +1243,171 @@ class IntroductionContentRule(BaseRule):
                         severity=Severity.WARNING,
                         location="Введение",
                         message=f"Во введении не найден обязательный элемент: {element_name}."
+                    )
+                )
+
+        return violations
+
+class ParagraphConclusionRule(BaseRule):
+    MAJOR_HEADER_REGEX = r'^(ГЛАВА\s+\d+|СОДЕРЖАНИЕ|ВВЕДЕНИЕ|ЗАКЛЮЧЕНИЕ|СПИСОК\s+(ИСТОЧНИКОВ|ЛИТЕРАТУРЫ|ИСПОЛЬЗОВАННЫХ\s+ИСТОЧНИКОВ)|ПРИЛОЖЕНИЕ)'
+    SUBHEADING_REGEX = r'^\d+(\.\d+)+\.?\s+'
+    NUMBERED_SECTION_REGEX = r'^\d+\.?\s+'
+    STOP_SECTION_REGEX = r'^(СПИСОК\s+(ИСТОЧНИКОВ|ЛИТЕРАТУРЫ|ИСПОЛЬЗОВАННЫХ\s+ИСТОЧНИКОВ)|ПРИЛОЖЕНИЕ)'
+    SKIP_SECTION_REGEX = r'^(ВВЕДЕНИЕ|ЗАКЛЮЧЕНИЕ|СОДЕРЖАНИЕ)'
+
+    # Начало вывода по итогу параграфа / главы
+    CONCLUSION_START_REGEX = (
+        r'^(ТАКИМ ОБРАЗОМ|ИТАК\b|ПОДВОДЯ ИТОГ|ОБОБЩАЯ|РЕЗЮМИРУЯ|СЛЕДОВАТЕЛЬНО|'
+        r'ПРОАНАЛИЗИРОВАВ|ВЫВОД[Ы]?\b|ВСЁ ВЫШЕСКАЗАННОЕ|ВЫШЕИЗЛОЖЕННОЕ)'
+    )
+
+    @staticmethod
+    def iter_body_sequence(paragraphs: List, tables: List):
+        """
+        Последовательность элементов тела документа в порядке следования:
+        ('p', абзац, индекс_абзаца) и ('tbl', таблица, None).
+        Нужна, чтобы видеть таблицы между абзацами.
+        """
+        items = []
+        p_idx = 0
+        para_iter = iter(paragraphs)
+        tbl_iter = iter(tables)
+        body = None
+        if paragraphs:
+            body = paragraphs[0]._element.getparent()
+        if body is None:
+            return items
+        for child in body.iterchildren():
+            if child.tag == qn('w:p'):
+                para = next(para_iter, None)
+                if para is not None:
+                    items.append(('p', para, p_idx))
+                    p_idx += 1
+            elif child.tag == qn('w:tbl'):
+                table = next(tbl_iter, None)
+                if table is not None:
+                    items.append(('tbl', table, None))
+        return items
+
+    def _is_centered(self, paragraph) -> bool:
+        align = paragraph.alignment
+        if align is None and paragraph.style and paragraph.style.paragraph_format:
+            align = paragraph.style.paragraph_format.alignment
+        return align == WD_ALIGN_PARAGRAPH.CENTER
+
+    def _header_type(self, paragraph) -> Optional[str]:
+        text = paragraph.text.strip()
+        if not text:
+            return None
+        text_upper = text.upper()
+        if re.match(self.MAJOR_HEADER_REGEX, text_upper):
+            return 'major'
+        if re.match(self.SUBHEADING_REGEX, text):
+            return 'sub'
+        # Раздел без слова 'Глава' (например '1. Понятие ...'), оформленный по центру
+        if re.match(self.NUMBERED_SECTION_REGEX, text) and self._is_centered(paragraph) and len(text) < 120:
+            return 'major'
+        return None
+
+    def check(self, doc: Document) -> List[Violation]:
+        violations: List[Violation] = []
+        rule_name = "ParagraphConclusionRule"
+
+        paragraphs = classify_paragraphs(doc)
+        items = self.iter_body_sequence(paragraphs, doc.tables)
+
+        starts = []
+        for i, (kind, obj, p_idx) in enumerate(items):
+            if kind != 'p':
+                continue
+            if getattr(obj, 'is_title_page', False) or getattr(obj, 'is_toc', False):
+                continue
+            header_type = self._header_type(obj)
+            if header_type:
+                starts.append((i, header_type, obj, p_idx))
+
+        for pos, (start_idx, header_type, header_para, header_idx) in enumerate(starts):
+            text_upper = header_para.text.strip().upper()
+
+            if re.match(self.STOP_SECTION_REGEX, text_upper):
+                break  # После списка источников и приложения выводы не проверяются
+            if header_type != 'major' and header_type != 'sub':
+                continue
+            if re.match(self.SKIP_SECTION_REGEX, text_upper):
+                continue  # Введение, заключение и содержание не являются параграфами/главами
+
+            end_idx = starts[pos + 1][0] if pos + 1 < len(starts) else len(items)
+            block = items[start_idx + 1:end_idx]
+
+            last_para = None
+            last_para_idx = None
+            last_item_kind = None
+            for kind, obj, p_idx in block:
+                if kind == 'p':
+                    if obj.text.strip():
+                        last_para = obj
+                        last_para_idx = p_idx
+                        last_item_kind = 'p'
+                else:
+                    last_item_kind = 'tbl'
+
+            if last_para is None:
+                continue  # Блок без содержания (например, заголовок главы перед параграфом)
+
+            header_text = header_para.text.strip()[:40]
+            loc = f"Конец '{header_text}' (абзац {last_para_idx + 1})"
+
+            # 1. Таблица в конце раздела
+            if last_item_kind == 'tbl':
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.ERROR,
+                        location=loc,
+                        message="В конце параграфа не допустима таблица (она должна быть внутри текста раздела)."
+                    )
+                )
+
+            # 2. Вывод по итогу раздела
+            if not re.match(self.CONCLUSION_START_REGEX, last_para.text.strip().upper()):
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.WARNING,
+                        location=loc,
+                        message="Параграф, глава всегда должны заканчиваться выводом (например: 'Таким образом, ...')."
+                    )
+                )
+
+            # 3. Недопустимые элементы в конце раздела
+            last_xml = last_para._element.xml
+            if '<w:drawing' in last_xml or '<w:pict' in last_xml:
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.ERROR,
+                        location=loc,
+                        message="В конце параграфа не допустимы рисунки."
+                    )
+                )
+
+            if 'oMath' in last_xml:
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.ERROR,
+                        location=loc,
+                        message="В конце параграфа не допустимы формулы."
+                    )
+                )
+
+            if re.search(r'\[\d+', last_para.text):
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.ERROR,
+                        location=loc,
+                        message="В конце параграфа не допустимы ссылки на источники."
                     )
                 )
 
