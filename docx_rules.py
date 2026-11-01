@@ -2162,3 +2162,108 @@ class TablesFormatRule(BaseRule):
             )
 
         return violations
+
+class FormulasRule(BaseRule):
+    NUMBERING_REGEX = re.compile(r'\((\d+)\)\s*$')
+
+    def _is_display_formula(self, paragraph) -> bool:
+        """Выносная формула: oMathPara либо короткий абзац с oMath."""
+        xml = paragraph._element.xml
+        if '<m:oMath' not in xml:
+            return False
+        if '<m:oMathPara' in xml:
+            return True
+        text = self.NUMBERING_REGEX.sub('', paragraph.text).strip()
+        return len(text) <= 25
+
+    def check(self, doc: Document) -> List[Violation]:
+        violations: List[Violation] = []
+        rule_name = "FormulasRule"
+
+        paragraphs = classify_paragraphs(doc)
+        formula_indices = set()
+
+        for idx, paragraph in enumerate(paragraphs):
+            if not self._is_display_formula(paragraph):
+                continue
+            formula_indices.add(idx)
+
+        formula_numbers = []
+
+        for idx in sorted(formula_indices):
+            paragraph = paragraphs[idx]
+            text = paragraph.text.strip()
+            loc = f"Формула (абзац {idx + 1}: '{text[:30]}')"
+
+            # 1. Формула выравнивается по центру
+            align = paragraph.alignment
+            if align is None and paragraph.style and paragraph.style.paragraph_format:
+                align = paragraph.style.paragraph_format.alignment
+            if align != WD_ALIGN_PARAGRAPH.CENTER:
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.ERROR,
+                        location=loc,
+                        message="Формула должна быть выровнена по центру."
+                    )
+                )
+
+            # 2. Справа проставляется нумерация, например (1)
+            match = self.NUMBERING_REGEX.search(text)
+            if match:
+                formula_numbers.append(int(match.group(1)))
+            else:
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.WARNING,
+                        location=loc,
+                        message="Справа от формулы должна проставляться нумерация, например (1)."
+                    )
+                )
+
+            # 3. Перед формулой описание, заканчивающееся двоеточием
+            prev_idx = idx - 1
+            while prev_idx >= 0 and (not paragraphs[prev_idx].text.strip() or prev_idx in formula_indices):
+                prev_idx -= 1
+            if prev_idx >= 0:
+                prev_text = paragraphs[prev_idx].text.strip()
+                if not prev_text.endswith(':'):
+                    violations.append(
+                        Violation(
+                            rule_name=rule_name,
+                            severity=Severity.WARNING,
+                            location=loc,
+                            message="Перед формулой должно быть описание, заканчивающееся двоеточием."
+                        )
+                    )
+
+            # 4. После формулы описываются примененные обозначения
+            next_idx = idx + 1
+            while next_idx < len(paragraphs) and (not paragraphs[next_idx].text.strip() or next_idx in formula_indices):
+                next_idx += 1
+            if next_idx < len(paragraphs):
+                next_text = paragraphs[next_idx].text.strip().lower()
+                if not next_text.startswith('где'):
+                    violations.append(
+                        Violation(
+                            rule_name=rule_name,
+                            severity=Severity.WARNING,
+                            location=loc,
+                            message="После формулы должны быть описаны примененные обозначения (например: 'где: ...')."
+                        )
+                    )
+
+        expected = list(range(1, len(formula_numbers) + 1))
+        if formula_numbers and sorted(formula_numbers) != expected:
+            violations.append(
+                Violation(
+                    rule_name=rule_name,
+                    severity=Severity.WARNING,
+                    location="Документ",
+                    message=f"Нумерация формул должна быть сквозной начиная с 1 (найдены: {sorted(formula_numbers)})."
+                )
+            )
+
+        return violations
