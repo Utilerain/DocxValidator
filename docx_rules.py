@@ -33,38 +33,153 @@ def is_toc_line(text: str) -> bool:
     return bool(re.search(r'(\t|\.{2,}|…)\s*\d+\s*$', text))
 
 def classify_paragraphs(doc: Document) -> List:
-    """
-    Размечает абзацы по типам, чтобы не натравливать MainTextFormatRule
-    и другие правила на титульный лист и строки Содержания.
-
-    Возвращает список размеченных абзацев: python-docx пересоздаёт обёртки
-    Paragraph при каждом обращении к doc.paragraphs, поэтому флаги,
-    выставленные на обёртках из другого списка, теряются.
-    """
+    """Эвристическая разметка: отсутствие оглавления не скрывает весь текст."""
     classified = list(doc.paragraphs)
-    in_title_page = True
-    in_toc = False
-
-    for p in classified:
+    first = next((i for i, p in enumerate(classified)
+                  if is_heading(p.text.strip()) and not is_toc_line(p.text)), 0)
+    in_toc = in_appendix = False
+    for i, p in enumerate(classified):
         text = p.text.strip()
-
-        # Определение начала оглавления (конец титульного листа)
-        if "СОДЕРЖАНИЕ" in text.upper() or "ОГЛАВЛЕНИЕ" in text.upper():
-            in_title_page = False
+        p.is_toc_heading = text.upper() in ('СОДЕРЖАНИЕ', 'ОГЛАВЛЕНИЕ')
+        if p.is_toc_heading:
             in_toc = True
-            p.is_title_page = False
-            p.is_toc = True
-            p.is_toc_heading = True
-            continue
-
-        # Определение конца Содержания (появление первого реального раздела)
-        if in_toc and any(kw in text.upper() for kw in ["ВВЕДЕНИЕ", "ГЛАВА", "ЗАКЛЮЧЕНИЕ"]) and not is_toc_line(text):
+        elif in_toc and is_heading(text) and not is_toc_line(text):
             in_toc = False
-
-        p.is_title_page = in_title_page
+        p.is_title_page = i < first
         p.is_toc = in_toc or is_toc_line(text)
-
+        if not p.is_toc and re.match(r'^ПРИЛОЖЕНИЕ\b', text, re.I):
+            in_appendix = True
+        p.is_appendix = in_appendix
+        p.is_special = (is_heading(text) or in_appendix
+                        or bool(re.match(r'^(?:Рис(?:унок)?\.?\s*\d+|Таблица\s+\d+|Продолжение таблицы|[–—-]\s+|\d+[.)]\s+)', text, re.I))
+                        or bool(p._p.xpath('./w:pPr/w:numPr'))
+                        or any(st.name.startswith('List') for st in style_chain(p.style))
+                        or FormulasRule()._is_display_formula(p))
+    for i, p in enumerate(classified):
+        if p._p.getnext() is not None and p._p.getnext().tag == qn('w:tbl'):
+            if i and re.match(r'^Таблица\s+\d+', classified[i-1].text, re.I):
+                p.is_special = True
     return classified
+
+class TextGridRule(BaseRule):
+    """Проверяет активную сетку, не навязывая точный шаг."""
+    def check(self, doc: Document) -> List[Violation]:
+        violations = []
+        for index, section in enumerate(doc.sections, 1):
+            grids = section._sectPr.findall(qn('w:docGrid'))
+            errors = []
+            if len(grids) > 1:
+                errors.append('В секции задано несколько противоречивых w:docGrid.')
+            if not grids:
+                errors.append('Отсутствует сетка текста (w:docGrid).')
+            for grid in grids:
+                kind = grid.get(qn('w:type'), 'none')
+                if kind not in ('lines', 'linesAndChars', 'snapToChars'):
+                    errors.append(f'Сетка текста не активна или имеет неизвестный type: {kind}.')
+                if kind in ('lines', 'linesAndChars'):
+                    pitch = grid.get(qn('w:linePitch'), '')
+                    if not re.fullmatch(r'[+]?[0-9]+', pitch) or int(pitch) <= 0:
+                        errors.append('linePitch сетки строк должен быть положительным целым.')
+                space = grid.get(qn('w:charSpace'))
+                if space is not None and not re.fullmatch(r'[+-]?[0-9]+', space):
+                    errors.append('charSpace должен быть целым числом (включая отрицательные и ноль).')
+            violations.extend(Violation('TextGridRule', Severity.ERROR, f'Секция {index}', e) for e in errors)
+        return violations
+
+
+def style_chain(style):
+    seen = set()
+    while style is not None and style.style_id not in seen:
+        seen.add(style.style_id)
+        yield style
+        style = style.base_style
+
+
+def effective(paragraph, attr, run=None):
+    """Прямой формат, цепочки символьных/абзацных стилей и docDefaults."""
+    sources = [run.font] if run is not None else [paragraph.paragraph_format]
+    if run is not None:
+        sources.extend(s.font for s in style_chain(run.style))
+    sources.extend((s.font if run is not None else s.paragraph_format)
+                   for s in style_chain(paragraph.style))
+    for source in sources:
+        value = getattr(source, attr)
+        if value is not None:
+            return value
+    from docx.text.font import Font
+    from docx.text.parfmt import ParagraphFormat
+    defaults = paragraph.part.package.main_document_part.styles.element.find(qn('w:docDefaults'))
+    if defaults is not None:
+        node = defaults.find(qn('w:rPrDefault' if run is not None else 'w:pPrDefault'))
+        if node is not None:
+            from copy import deepcopy
+            from docx.oxml import OxmlElement
+            wrapper = OxmlElement('w:r' if run is not None else 'w:p')
+            props = node.find(qn('w:rPr' if run is not None else 'w:pPr'))
+            if props is not None:
+                wrapper.append(deepcopy(props))
+            return getattr(Font(wrapper) if run is not None else ParagraphFormat(wrapper), attr)
+    return None
+
+
+def field_instructions(container) -> List[str]:
+    """Инструкции полей: w:fldSimple@w:instr и сложные поля (fldChar begin/end)."""
+    instructions = [n.get(qn('w:instr'), '') for n in container._element.iter(qn('w:fldSimple'))]
+    stack = []
+    for node in container._element.iter():
+        if node.tag == qn('w:fldChar'):
+            kind = node.get(qn('w:fldCharType'))
+            if kind == 'begin':
+                stack.append('')
+            elif kind == 'separate' and stack:
+                instructions.append(stack[-1])
+            elif kind == 'end' and stack:
+                instructions.append(stack.pop())
+        elif node.tag == qn('w:instrText') and stack:
+            stack[-1] += node.text or ''
+    return instructions
+
+
+def has_field(container, name: str) -> bool:
+    """True, если контейнер содержит поле с именем name (PAGE, TOC, ...)."""
+    return any(re.match(rf'^\s*{name}\b', instruction, re.I) for instruction in field_instructions(container))
+
+
+def has_page_field(container) -> bool:
+    return has_field(container, 'PAGE')
+
+
+def full_text(paragraph) -> str:
+    """Текст абзаца: w:t и m:t, включая содержимое полей и гиперссылок; w:tab -> '\\t'."""
+    parts = []
+    for node in paragraph._p.iter():
+        if node.tag in (qn('w:t'), qn('m:t')):
+            parts.append(node.text or '')
+        elif node.tag == qn('w:tab'):
+            parts.append('\t')
+        elif node.tag in (qn('w:br'), qn('w:cr')):
+            parts.append('\n')
+    return ''.join(parts)
+
+
+def paragraph_section_indices(doc: Document) -> List[int]:
+    """Индекс секции для каждого абзаца doc.paragraphs (секции разделяются sectPr внутри абзаца)."""
+    mapping = []
+    current = 0
+    for child in doc.element.body.iterchildren():
+        if child.tag == qn('w:p'):
+            mapping.append(current)
+            pPr = child.find(qn('w:pPr'))
+            if pPr is not None and pPr.find(qn('w:sectPr')) is not None:
+                current += 1
+    return mapping
+
+
+def is_heading(text):
+    return bool(re.match(r'^(?:ГЛАВА\s+\d+|\d+(?:\.\d+)+\.?\s+|'
+                         r'(?:СОДЕРЖАНИЕ|ОГЛАВЛЕНИЕ|ВВЕДЕНИЕ|ЗАКЛЮЧЕНИЕ|БИБЛИОГРАФИЯ)$|'
+                         r'СПИСОК\s+(?:ИСТОЧНИКОВ|ЛИТЕРАТУРЫ|ИСПОЛЬЗОВАННЫХ)|ПРИЛОЖЕНИЕ\b)', text, re.I))
+
 
 class PageMarginsRule(BaseRule):
     def __init__(self, top=2.0, bottom=2.0, left=3.0, right=1.5):
@@ -113,25 +228,14 @@ class MainTextFormatRule(BaseRule):
         self.indent_tolerance_cm = indent_tolerance_cm
 
     def _get_effective_font_name(self, run, paragraph) -> Optional[str]:
-        if run.font.name:
-            return run.font.name
-        if paragraph.style and paragraph.style.font and paragraph.style.font.name:
-            return paragraph.style.font.name
-        return None
+        return effective(paragraph, 'name', run)
 
     def _get_effective_font_size(self, run, paragraph) -> Optional[float]:
-        if run.font.size:
-            return run.font.size.pt
-        if paragraph.style and paragraph.style.font and paragraph.style.font.size:
-            return paragraph.style.font.size.pt
-        return None
+        size = effective(paragraph, 'size', run)
+        return size.pt if size is not None else None
 
     def _get_effective_alignment(self, paragraph):
-        if paragraph.alignment is not None:
-            return paragraph.alignment
-        if paragraph.style and paragraph.style.paragraph_format.alignment is not None:
-            return paragraph.style.paragraph_format.alignment
-        return None
+        return effective(paragraph, 'alignment')
 
     def check(self, doc: Document) -> List[Violation]:
         violations: List[Violation] = []
@@ -140,7 +244,7 @@ class MainTextFormatRule(BaseRule):
         paragraphs = classify_paragraphs(doc)
 
         for p_idx, paragraph in enumerate(paragraphs, start=1):
-            if getattr(paragraph, 'is_title_page', False) or getattr(paragraph, 'is_toc', False):
+            if paragraph.is_title_page or paragraph.is_toc or paragraph.is_special:
                 continue  # Пропускаем титульный лист и оглавление
 
             text = paragraph.text.strip()
@@ -163,9 +267,7 @@ class MainTextFormatRule(BaseRule):
                 )
 
             # 2. Красная строка (1,25 см)
-            indent = fmt.first_line_indent
-            if indent is None and paragraph.style and paragraph.style.paragraph_format.first_line_indent:
-                indent = paragraph.style.paragraph_format.first_line_indent
+            indent = effective(paragraph, 'first_line_indent')
 
             if indent is None:
                 violations.append(
@@ -189,11 +291,9 @@ class MainTextFormatRule(BaseRule):
                     )
 
             # 3. Междустрочный интервал (1.5)
-            line_sp = fmt.line_spacing
-            if line_sp is None and paragraph.style and paragraph.style.paragraph_format.line_spacing:
-                line_sp = paragraph.style.paragraph_format.line_spacing
+            line_sp = effective(paragraph, 'line_spacing')
 
-            if line_sp is not None and abs(float(line_sp) - self.line_spacing) > 0.05:
+            if line_sp is None or abs(float(line_sp) - self.line_spacing) > 0.05:
                 violations.append(
                     Violation(
                         rule_name=rule_name,
@@ -204,8 +304,10 @@ class MainTextFormatRule(BaseRule):
                 )
 
             # 4. Отступы до и после абзаца (0 pt)
-            space_before = fmt.space_before.pt if fmt.space_before else 0.0
-            space_after = fmt.space_after.pt if fmt.space_after else 0.0
+            space_before = effective(paragraph, 'space_before')
+            space_before = space_before.pt if space_before is not None else 0.0
+            space_after = effective(paragraph, 'space_after')
+            space_after = space_after.pt if space_after is not None else 0.0
 
             if abs(space_before - self.space_before_pt) > 0.1:
                 violations.append(
@@ -228,7 +330,7 @@ class MainTextFormatRule(BaseRule):
                 )
 
             # 5. Запрет висячих строк
-            if fmt.widow_control is False:
+            if effective(paragraph, 'widow_control') is False:
                 violations.append(
                     Violation(
                         rule_name=rule_name,
@@ -247,7 +349,7 @@ class MainTextFormatRule(BaseRule):
                 run_loc = f"{loc}, фрагмент {r_idx} ('{run_text[:15]}')"
 
                 font_name = self._get_effective_font_name(run, paragraph)
-                if font_name and font_name != self.font_name:
+                if font_name != self.font_name:
                     violations.append(
                         Violation(
                             rule_name=rule_name,
@@ -258,7 +360,7 @@ class MainTextFormatRule(BaseRule):
                     )
 
                 font_size = self._get_effective_font_size(run, paragraph)
-                if font_size and abs(font_size - self.font_size) > 0.1:
+                if font_size is None or abs(font_size - self.font_size) > 0.1:
                     violations.append(
                         Violation(
                             rule_name=rule_name,
@@ -269,7 +371,7 @@ class MainTextFormatRule(BaseRule):
                     )
 
                 if not self.allow_formatting_styles:
-                    if run.bold:
+                    if effective(paragraph, 'bold', run):
                         violations.append(
                             Violation(
                                 rule_name=rule_name,
@@ -278,7 +380,7 @@ class MainTextFormatRule(BaseRule):
                                 message="В тексте использовано полужирное начертание (bold)."
                             )
                         )
-                    if run.italic:
+                    if effective(paragraph, 'italic', run):
                         violations.append(
                             Violation(
                                 rule_name=rule_name,
@@ -287,7 +389,7 @@ class MainTextFormatRule(BaseRule):
                                 message="В тексте использован курсив (italic)."
                             )
                         )
-                    if run.underline:
+                    if effective(paragraph, 'underline', run):
                         violations.append(
                             Violation(
                                 rule_name=rule_name,
@@ -311,22 +413,14 @@ class PageNumberingRule(BaseRule):
         self.alignment = target_alignment
 
     def _has_page_number_field(self, header_or_paragraph) -> bool:
-        xml_str = header_or_paragraph._element.xml
-        return ("instrText" in xml_str and "PAGE" in xml_str) or ("w:fldSimple" in xml_str and "PAGE" in xml_str)
+        return has_page_field(header_or_paragraph)
 
     def _get_effective_font_name(self, run, paragraph) -> Optional[str]:
-        if run.font.name:
-            return run.font.name
-        if paragraph.style and paragraph.style.font and paragraph.style.font.name:
-            return paragraph.style.font.name
-        return None
+        return effective(paragraph, 'name', run)
 
     def _get_effective_font_size(self, run, paragraph) -> Optional[float]:
-        if run.font.size:
-            return run.font.size.pt
-        if paragraph.style and paragraph.style.font and paragraph.style.font.size:
-            return paragraph.style.font.size.pt
-        return None
+        size = effective(paragraph, 'size', run)
+        return size.pt if size is not None else None
 
     def check(self, doc: Document) -> List[Violation]:
         violations: List[Violation] = []
@@ -335,48 +429,85 @@ class PageNumberingRule(BaseRule):
         if not doc.sections:
             return violations
 
-        first_section = doc.sections[0]
+        paragraphs = classify_paragraphs(doc)
+        section_indices = paragraph_section_indices(doc)
 
-        if first_section.different_first_page_header_footer:
-            if self._has_page_number_field(first_section.first_page_header):
-                violations.append(
-                    Violation(
-                        rule_name=rule_name,
-                        severity=Severity.ERROR,
-                        location="Секция 1 (Колонтитул первой страницы)",
-                        message="На титульном листе присутствует нумерация страниц."
-                    )
-                )
-        else:
-            if self._has_page_number_field(first_section.header):
-                violations.append(
-                    Violation(
-                        rule_name=rule_name,
-                        severity=Severity.WARNING,
-                        location="Секция 1 (Верхний колонтитул)",
-                        message="Не включена опция 'Особый колонтитул для первой страницы'. На титульном листе не должно быть нумерации."
-                    )
-                )
+        # Контент по секциям: основной текст / приложение (титул и содержание не в счёт)
+        section_content: dict = {}
+        for paragraph, sec_idx in zip(paragraphs, section_indices):
+            if paragraph.is_title_page or paragraph.is_toc:
+                continue
+            has_visual = bool(paragraph._p.xpath('.//w:drawing|.//w:pict'))
+            if not (paragraph.text.strip() or has_visual):
+                continue
+            info = section_content.setdefault(sec_idx, {'main': False, 'appendix': False})
+            if paragraph.is_appendix:
+                info['appendix'] = True
+            else:
+                info['main'] = True
 
         for sec_idx, section in enumerate(doc.sections, start=1):
-            header = section.header
+            info = section_content.get(sec_idx - 1, {})
+            has_main = info.get('main', False)
 
-            if not self._has_page_number_field(header):
+            # Секции приложений проверяет AppendixFormatRule (PAGE там быть не должен)
+            if info.get('appendix', False):
                 continue
 
-            paragraphs = header.paragraphs
+            header = section.header
 
-            if len(paragraphs) > 1:
+            # 1. В секции с основным текстом PAGE обязан быть в верхнем колонтитуле
+            if has_main and not self._has_page_number_field(header):
+                violations.append(Violation(
+                    rule_name=rule_name,
+                    severity=Severity.ERROR,
+                    location=f"Секция {sec_idx} (Верхний колонтитул)",
+                    message="В секции с основным текстом отсутствует поле PAGE в верхнем колонтитуле."
+                ))
+
+            # 2. Чётные страницы: при включённой опции PAGE должен быть и в чётном колонтитуле
+            if has_main and doc.settings.odd_and_even_pages_header_footer \
+                    and not self._has_page_number_field(section.even_page_header):
+                violations.append(Violation(
+                    rule_name=rule_name,
+                    severity=Severity.ERROR,
+                    location=f"Секция {sec_idx} (Верхний колонтитул чётных страниц)",
+                    message="Включена нумерация чётных страниц, но поле PAGE отсутствует в верхнем колонтитуле чётных страниц."
+                ))
+
+            # 3. Нижние колонтитулы не должны содержать нумерацию
+            footers = [section.footer]
+            if section.different_first_page_header_footer:
+                footers.append(section.first_page_footer)
+            if doc.settings.odd_and_even_pages_header_footer:
+                footers.append(section.even_page_footer)
+            for footer in footers:
+                if footer.is_linked_to_previous:
+                    continue  # проверяется в секции, где задан колонтитул
+                if self._has_page_number_field(footer):
+                    violations.append(Violation(
+                        rule_name=rule_name,
+                        severity=Severity.ERROR,
+                        location=f"Секция {sec_idx} (Нижний колонтитул)",
+                        message="Нумерация страниц должна располагаться в верхнем колонтитуле, а не в нижнем."
+                    ))
+
+            # 4. Лишние пустые строки в колонтитуле
+            if (self._has_page_number_field(header) or has_main) and len(header.paragraphs) > 1:
                 violations.append(
                     Violation(
                         rule_name=rule_name,
                         severity=Severity.ERROR,
                         location=f"Секция {sec_idx} (Верхний колонтитул)",
-                        message=f"В верхнем колонтитуле с нумерацией обнаружены лишние пустые строки (всего строк: {len(paragraphs)}, должна быть 1)."
+                        message=f"В верхнем колонтитуле обнаружены лишние пустые строки (всего строк: {len(header.paragraphs)}, должна быть 1)."
                     )
                 )
 
-            for p_idx, paragraph in enumerate(paragraphs, start=1):
+            # 5. Формат нумерации (шрифт, кегль, выравнивание)
+            if not self._has_page_number_field(header):
+                continue
+
+            for p_idx, paragraph in enumerate(header.paragraphs, start=1):
                 if "\n" in paragraph.text:
                     violations.append(
                         Violation(
@@ -401,7 +532,9 @@ class PageNumberingRule(BaseRule):
                         )
                     )
 
-                for r_idx, run in enumerate(paragraph.runs, start=1):
+                for r_idx, node in enumerate(paragraph._p.xpath('.//w:r'), start=1):
+                    from docx.text.run import Run
+                    run = Run(node, paragraph)
                     font_name = self._get_effective_font_name(run, paragraph)
                     if font_name and font_name != self.font_name:
                         violations.append(
@@ -423,6 +556,31 @@ class PageNumberingRule(BaseRule):
                                 message=f"Размер шрифта нумерации {font_size} pt, а должен быть {self.font_size} pt."
                             )
                         )
+
+        # Титульный лист (первая секция) не нумеруется
+        first_section = doc.sections[0]
+        has_title = any(p.is_title_page and p.text.strip() for p in paragraphs)
+        if has_title:
+            if first_section.different_first_page_header_footer:
+                if self._has_page_number_field(first_section.first_page_header):
+                    violations.append(
+                        Violation(
+                            rule_name=rule_name,
+                            severity=Severity.ERROR,
+                            location="Секция 1 (Колонтитул первой страницы)",
+                            message="На титульном листе присутствует нумерация страниц."
+                        )
+                    )
+            else:
+                if self._has_page_number_field(first_section.header):
+                    violations.append(
+                        Violation(
+                            rule_name=rule_name,
+                            severity=Severity.WARNING,
+                            location="Секция 1 (Верхний колонтитул)",
+                            message="Не включена опция 'Особый колонтитул для первой страницы'. На титульном листе не должно быть нумерации."
+                        )
+                    )
 
         return violations
 
@@ -642,7 +800,7 @@ class TableOfContentsRule(BaseRule):
                 first_indent = fmt.first_line_indent
                 if first_indent is None and p.style and p.style.paragraph_format:
                     first_indent = p.style.paragraph_format.first_line_indent
-                if first_indent is None or first_indent.cm <= 0.05:
+                if first_indent is None or abs(first_indent.cm - 1.25) > 0.05:
                     violations.append(
                         Violation(
                             rule_name=rule_name,
@@ -667,14 +825,13 @@ class TableOfContentsRule(BaseRule):
         toc_entries = []
         for p_idx in range(toc_header_index + 1, len(doc.paragraphs)):
             p = doc.paragraphs[p_idx]
-            text = p.text.strip()
+            text = full_text(p).strip()
             if not text:
                 continue
 
-            is_toc_field = 'TOC' in p._element.xml or 'w:fldSimple' in p._element.xml or 'w:instrText' in p._element.xml
-            has_page_num_at_end = re.search(r'\d+\s*$', text) is not None
+            is_toc_field = has_field(p, 'TOC')
 
-            if not has_page_num_at_end and not is_toc_field and text.upper() in ["ВВЕДЕНИЕ", "ЗАКЛЮЧЕНИЕ", "ПРИЛОЖЕНИЕ"]:
+            if is_heading(text) and not is_toc_line(text) and not is_toc_field:
                 break
 
             has_page_break = any(
@@ -687,9 +844,50 @@ class TableOfContentsRule(BaseRule):
             if has_page_break:
                 break
 
+        # Если содержание построено авто-полем TOC — ручные проверки записей не применяются
+        toc_is_field = any(has_field(p, 'TOC') for _, p in toc_entries)
+
+        if not toc_is_field:
+            # Общий правый табулятор у записей содержания
+            tab_positions = set()
+            entries_without_tab = []
+            for p_num, p in toc_entries:
+                right_tabs = p._p.xpath('./w:pPr/w:tabs/w:tab[@w:val="right"]')
+                if not right_tabs:
+                    entries_without_tab.append(p_num)
+                for tab in right_tabs:
+                    pos = tab.get(qn('w:pos'))
+                    if pos is not None:
+                        tab_positions.add(int(pos))
+
+            for p_num in entries_without_tab:
+                p = dict(toc_entries)[p_num]
+                text = full_text(p).strip()
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.WARNING,
+                        location=f"Оглавление, абзац {p_num} ('{text[:30]}...')",
+                        message="У пункта оглавления отсутствует правый табулятор (w:tabs, val=right) для позиции номера страницы."
+                    )
+                )
+            if tab_positions and len(toc_entries) > len(entries_without_tab) and len(tab_positions) > 1:
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.WARNING,
+                        location="Оглавление",
+                        message=f"Правый табулятор пунктов оглавления должен быть на одной позиции "
+                                f"(найдено разных позиций: {len(tab_positions)})."
+                    )
+                )
+
         for p_num, p in toc_entries:
-            text = p.text.strip()
+            text = full_text(p).strip()
             loc = f"Оглавление, абзац {p_num} ('{text[:30]}...')"
+
+            if toc_is_field:
+                continue  # авто-оглавление: ручные проверки записей пропускаются
 
             if re.search(r'\.{3,}', text) or re.search(r'(\.\s*){4,}', text):
                 violations.append(
@@ -720,7 +918,7 @@ class TableOfContentsRule(BaseRule):
             if first_indent is None and p.style and p.style.paragraph_format:
                 first_indent = p.style.paragraph_format.first_line_indent
 
-            if first_indent is not None and first_indent.cm > 0.05:
+            if first_indent is not None and abs(first_indent.cm) > 0.05:
                 violations.append(
                     Violation(
                         rule_name=rule_name,
@@ -730,10 +928,10 @@ class TableOfContentsRule(BaseRule):
                     )
                 )
 
-            num_match = re.match(r'^(Глава\s+\d+\.|Глава\s+\d+|\d+(\.\d+)*\.)(\s+)', text, re.IGNORECASE)
+            num_match = re.match(r'^(?:Глава\s+)?\d+(?:\.\d+)*\.?([ 	]*)(?=[^\d.\s])', text, re.IGNORECASE)
             if num_match:
-                spaces = num_match.group(3)
-                if len(spaces) > 1:
+                spaces = num_match.group(1)
+                if spaces != ' ':
                     violations.append(
                         Violation(
                             rule_name=rule_name,
@@ -743,10 +941,57 @@ class TableOfContentsRule(BaseRule):
                         )
                     )
 
+        # Сверка заголовков документа с записями содержания
+        chapter_entries = set()
+        numbered_entries = set()
+        for _, p in toc_entries:
+            entry_text = full_text(p).strip()
+            chapter_match = re.match(r'^Глава\s+(\d+)\b', entry_text, re.IGNORECASE)
+            if chapter_match:
+                chapter_entries.add(int(chapter_match.group(1)))
+                continue
+            number_match = re.match(r'^(\d+(?:\.\d+)*)\.?\s', entry_text)
+            if number_match:
+                numbered_entries.add(number_match.group(1))
+
+        for idx, p in enumerate(classify_paragraphs(doc)):
+            if p.is_title_page or p.is_toc:
+                continue
+            body_text = p.text.strip()
+            loc = f"Абзац {idx + 1} ('{body_text[:30]}...')"
+
+            chapter_match = re.match(r'^Глава\s+(\d+)\b', body_text, re.IGNORECASE)
+            if chapter_match:
+                number = int(chapter_match.group(1))
+                covered = number in chapter_entries or any(
+                    entry == str(number) or entry.startswith(f'{number}.')
+                    for entry in numbered_entries)
+                if not covered:
+                    violations.append(
+                        Violation(
+                            rule_name=rule_name,
+                            severity=Severity.WARNING,
+                            location=loc,
+                            message=f"Заголовка 'Глава {number}' нет в содержании."
+                        )
+                    )
+                continue
+
+            number_match = re.match(r'^(\d+(?:\.\d+)+)\.?\s+', body_text)
+            if number_match and number_match.group(1) not in numbered_entries:
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.WARNING,
+                        location=loc,
+                        message=f"Параграфа {number_match.group(1)} нет в содержании."
+                    )
+                )
+
         return violations
 
 class SectionFormatRule(BaseRule):
-    MAJOR_HEADER_REGEX = r'^(ГЛАВА\s+\d+|СОДЕРЖАНИЕ|ВВЕДЕНИЕ|ЗАКЛЮЧЕНИЕ|СПИСОК\s+(ИСТОЧНИКОВ|ЛИТЕРАТУРЫ)|ПРИЛОЖЕНИЕ)'
+    MAJOR_HEADER_REGEX = r'^(ГЛАВА\s+\d+|СОДЕРЖАНИЕ|ОГЛАВЛЕНИЕ|ВВЕДЕНИЕ|ЗАКЛЮЧЕНИЕ|БИБЛИОГРАФИЯ|СПИСОК\s+(ИСТОЧНИКОВ|ЛИТЕРАТУРЫ|ИСПОЛЬЗОВАННЫХ\s+ИСТОЧНИКОВ)|ПРИЛОЖЕНИЕ)'
     SUBHEADING_REGEX = r'^\d+(\.\d+)+\.?\s+'
 
     def _is_empty(self, paragraph) -> bool:
@@ -755,15 +1000,13 @@ class SectionFormatRule(BaseRule):
     def _is_bold(self, paragraph) -> bool:
         runs_with_text = [r for r in paragraph.runs if r.text.strip()]
         if runs_with_text:
-            return all(r.bold for r in runs_with_text)
+            return all(effective(paragraph, 'bold', r) for r in runs_with_text)
         if paragraph.style and paragraph.style.font:
             return paragraph.style.font.bold or False
         return False
 
     def _is_centered(self, paragraph) -> bool:
-        align = paragraph.alignment
-        if align is None and paragraph.style and paragraph.style.paragraph_format:
-            align = paragraph.style.paragraph_format.alignment
+        align = effective(paragraph, 'alignment')
         return align == WD_ALIGN_PARAGRAPH.CENTER
 
     def _has_red_line(self, paragraph) -> bool:
@@ -771,7 +1014,8 @@ class SectionFormatRule(BaseRule):
         indent = fmt.first_line_indent
         if indent is None and paragraph.style and paragraph.style.paragraph_format:
             indent = paragraph.style.paragraph_format.first_line_indent
-        return indent is not None and indent.cm > 0.05
+        indent = effective(paragraph, 'first_line_indent')
+        return indent is not None and abs(indent.cm - 1.25) <= 0.05
 
     def _has_page_break_before(self, paragraphs: List, idx: int) -> bool:
         if idx == 0:
@@ -779,7 +1023,7 @@ class SectionFormatRule(BaseRule):
 
         p = paragraphs[idx]
 
-        if p.paragraph_format.page_break_before:
+        if effective(p, 'page_break_before'):
             return True
 
         prev_p = paragraphs[idx - 1]
@@ -804,7 +1048,7 @@ class SectionFormatRule(BaseRule):
                 continue
 
             # Игнорируем титульный лист и строки оглавления
-            if getattr(p, 'is_title_page', False) or getattr(p, 'is_toc', False) or is_toc_line(text):
+            if p.is_title_page or (p.is_toc and not p.is_toc_heading) or p.is_appendix or is_toc_line(text):
                 continue
 
             text_upper = text.upper()
@@ -839,27 +1083,9 @@ class SectionFormatRule(BaseRule):
                     )
                 )
 
-            # 3. Проверка красной строки (не должно быть для выравнивания по центру)
-            if self._is_centered(p):
-                if self._has_red_line(p):
-                    violations.append(
-                        Violation(
-                            rule_name=rule_name,
-                            severity=Severity.WARNING,
-                            location=loc,
-                            message=f"У центрированного заголовка ({header_type.lower()}) не должно быть красной строки (абзацного отступа)."
-                        )
-                    )
-            else:
-                if not self._has_red_line(p):
-                    violations.append(
-                        Violation(
-                            rule_name=rule_name,
-                            severity=Severity.ERROR,
-                            location=loc,
-                            message=f"У заголовка ({header_type.lower()}) должна быть установлена красная строка."
-                        )
-                    )
+            if not self._has_red_line(p):
+                violations.append(Violation(rule_name, Severity.ERROR, loc,
+                                            'Красная строка заголовка должна быть 1.25 см.'))
 
             # 4. Проверка правила «с новой страницы»
             starts_new_page = self._has_page_break_before(paragraphs, idx)
@@ -872,7 +1098,7 @@ class SectionFormatRule(BaseRule):
                         message="Крупные разделы (Глава, Содержание, Введение, Заключение, Список источников) должны начинаться с новой страницы."
                     )
                 )
-            elif is_sub and p.paragraph_format.page_break_before:
+            elif is_sub and starts_new_page:
                 violations.append(
                     Violation(
                         rule_name=rule_name,
@@ -1291,9 +1517,7 @@ class ParagraphConclusionRule(BaseRule):
         return items
 
     def _is_centered(self, paragraph) -> bool:
-        align = paragraph.alignment
-        if align is None and paragraph.style and paragraph.style.paragraph_format:
-            align = paragraph.style.paragraph_format.alignment
+        align = effective(paragraph, 'alignment')
         return align == WD_ALIGN_PARAGRAPH.CENTER
 
     def _header_type(self, paragraph) -> Optional[str]:
@@ -1417,8 +1641,12 @@ class ParagraphConclusionRule(BaseRule):
 class SourceReferencesRule(BaseRule):
     CHAPTER_REGEX = r'^ГЛАВА\s+\d+'
     STOP_SECTION_REGEX = r'^(СПИСОК\s+(ИСТОЧНИКОВ|ЛИТЕРАТУРЫ|ИСПОЛЬЗОВАННЫХ\s+ИСТОЧНИКОВ)|ПРИЛОЖЕНИЕ)'
+    BIBLIOGRAPHY_HEADER_REGEX = r'^(СПИСОК\s+(ИСТОЧНИКОВ|ЛИТЕРАТУРЫ|ИСПОЛЬЗОВАННЫХ\s+ИСТОЧНИКОВ)|БИБЛИОГРАФИЯ)'
     LINK_REGEX = re.compile(r'\[([^\[\]]{1,30})\]')
     VALID_LINK_REGEX = r'^\d+(,\s*с\.\s*\d+)?$'
+    # Признаки электронного ресурса в записи библиографии
+    ELECTRONIC_REGEX = re.compile(r'(https?://|www\.|электронный\s+ресурс|режим\s+доступа|дата\s+обращения)',
+                                  re.IGNORECASE)
 
     # Строки листингов кода не являются ссылками на источники
     CODE_LINE_REGEX = re.compile(
@@ -1438,6 +1666,29 @@ class SourceReferencesRule(BaseRule):
         rule_name = "SourceReferencesRule"
 
         paragraphs = classify_paragraphs(doc)
+
+        # Номера записей библиографии (для сверки со ссылками [N])
+        bibliography = {}
+        electronic = set()
+        in_refs = False
+        for paragraph in paragraphs:
+            text = paragraph.text.strip()
+            upper = text.upper()
+            if not in_refs:
+                if (re.match(self.BIBLIOGRAPHY_HEADER_REGEX, upper) and len(upper) < 100
+                        and not is_toc_line(text)
+                        and not getattr(paragraph, 'is_toc', False)
+                        and not getattr(paragraph, 'is_title_page', False)):
+                    in_refs = True
+                continue
+            if re.match(self.STOP_SECTION_REGEX, upper):
+                break  # следующая секция после списка источников
+            item_match = re.match(r'^(\d+)[\.\)]\s+', text)
+            if item_match:
+                num = int(item_match.group(1))
+                bibliography[num] = text
+                if self.ELECTRONIC_REGEX.search(text):
+                    electronic.add(num)
 
         in_code = False
         for p_idx, paragraph in enumerate(paragraphs, start=1):
@@ -1483,6 +1734,28 @@ class SourceReferencesRule(BaseRule):
                         )
                     )
                     continue
+
+                # Сверка с библиографией: источник должен присутствовать в списке
+                num_match = re.match(self.VALID_LINK_REGEX, content)
+                num = int(re.match(r'\d+', content).group(0))
+                if bibliography and num not in bibliography:
+                    violations.append(
+                        Violation(
+                            rule_name=rule_name,
+                            severity=Severity.ERROR,
+                            location=loc,
+                            message=f"Источник [{num}] отсутствует в списке источников (нумерованная запись не найдена)."
+                        )
+                    )
+                elif num in electronic and num_match.group(1):
+                    violations.append(
+                        Violation(
+                            rule_name=rule_name,
+                            severity=Severity.WARNING,
+                            location=loc,
+                            message=f"Источник [{num}] — электронный ресурс, указание страницы не имеет смысла: '[{content}]'."
+                        )
+                    )
 
                 # Ссылка ставится в конце абзаца перед точкой
                 tail = text[end:].strip()
@@ -1554,105 +1827,85 @@ class SourceReferencesRule(BaseRule):
 
 class AppendixFormatRule(BaseRule):
     HEADER_REGEX = r'^ПРИЛОЖЕНИЕ'
-
-    @staticmethod
-    def _get_paragraph_section_indices(doc: Document) -> List[int]:
-        """Индекс секции для каждого абзаца doc.paragraphs (секции разделяются sectPr внутри абзаца)."""
-        mapping = []
-        current = 0
-        for child in doc.element.body.iterchildren():
-            if child.tag == qn('w:p'):
-                mapping.append(current)
-                pPr = child.find(qn('w:pPr'))
-                if pPr is not None and pPr.find(qn('w:sectPr')) is not None:
-                    current += 1
-        return mapping
+    LETTER_REGEX = re.compile(r'^ПРИЛОЖЕНИЕ\s+([А-Я])\b')
+    # Русский алфавит без Ё — порядок букв приложений по ГОСТ 7.32
+    ALPHABET = 'АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ'
 
     def _has_page_number_field(self, header) -> bool:
-        xml_str = header._element.xml
-        return ("instrText" in xml_str and "PAGE" in xml_str) or ("w:fldSimple" in xml_str and "PAGE" in xml_str)
-
-    def _get_effective_font_size(self, run, paragraph) -> Optional[float]:
-        if run.font.size:
-            return run.font.size.pt
-        if paragraph.style and paragraph.style.font and paragraph.style.font.size:
-            return paragraph.style.font.size.pt
-        return None
+        return has_page_field(header)
 
     def check(self, doc: Document) -> List[Violation]:
         violations: List[Violation] = []
         rule_name = "AppendixFormatRule"
 
         paragraphs = classify_paragraphs(doc)
+        section_indices = paragraph_section_indices(doc)
 
-        appendix_idx = None
-        for idx, paragraph in enumerate(paragraphs):
-            text = paragraph.text.strip()
-            if getattr(paragraph, 'is_title_page', False) or getattr(paragraph, 'is_toc', False):
-                continue
-            if re.match(self.HEADER_REGEX, text.upper()):
-                appendix_idx = idx
-                break
+        appendix_indices = [idx for idx, paragraph in enumerate(paragraphs)
+                            if not paragraph.is_title_page and not paragraph.is_toc
+                            and re.match(self.HEADER_REGEX, paragraph.text.strip().upper())]
+        if not appendix_indices:
+            return violations  # Приложений в документе нет
 
-        if appendix_idx is None:
-            return violations  # Приложения в документе нет
+        # 1. Заголовки ВСЕХ приложений: правое выравнивание, полужирный, последовательные буквы
+        prev_letter = None
+        for idx in appendix_indices:
+            header_para = paragraphs[idx]
+            header_text = header_para.text.strip()
+            loc = f"Приложение (абзац {idx + 1}: '{header_text[:30]}')"
 
-        header_para = paragraphs[appendix_idx]
-        header_text = header_para.text.strip()[:30]
-        loc = f"Приложение (абзац {appendix_idx + 1}: '{header_text}')"
-
-        # 1. Заголовок выравнивается по правому краю
-        align = header_para.alignment
-        if align is None and header_para.style and header_para.style.paragraph_format:
-            align = header_para.style.paragraph_format.alignment
-        if align != WD_ALIGN_PARAGRAPH.RIGHT:
-            violations.append(
-                Violation(
-                    rule_name=rule_name,
-                    severity=Severity.ERROR,
-                    location=loc,
-                    message="Заголовок приложения должен быть выровнен по правому краю."
+            align = effective(header_para, 'alignment')
+            if align != WD_ALIGN_PARAGRAPH.RIGHT:
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.ERROR,
+                        location=loc,
+                        message="Заголовок приложения должен быть выровнен по правому краю."
+                    )
                 )
-            )
 
-        is_bold = any(run.bold for run in header_para.runs if run.text.strip())
-        if not is_bold and header_para.style and header_para.style.font:
-            is_bold = header_para.style.font.bold or False
-        if not is_bold:
-            violations.append(
-                Violation(
-                    rule_name=rule_name,
-                    severity=Severity.WARNING,
-                    location=loc,
-                    message="Заголовок приложения должен быть выделен полужирным шрифтом."
+            is_bold = any(effective(header_para, 'bold', run) for run in header_para.runs if run.text.strip())
+            if not is_bold and header_para.style and header_para.style.font:
+                is_bold = bool(header_para.style.font.bold)
+            if not is_bold:
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.WARNING,
+                        location=loc,
+                        message="Заголовок приложения должен быть выделен полужирным шрифтом."
+                    )
                 )
-            )
 
-        # 2. В приложении шрифт 12 пт и межстрочный интервал 1
-        for offset, paragraph in enumerate(paragraphs[appendix_idx + 1:], start=appendix_idx + 1):
+            letter_match = self.LETTER_REGEX.match(header_text.upper())
+            if letter_match and letter_match.group(1) in self.ALPHABET:
+                letter = letter_match.group(1)
+                if prev_letter is not None:
+                    expected = self.ALPHABET[self.ALPHABET.index(prev_letter) + 1] \
+                        if self.ALPHABET.index(prev_letter) + 1 < len(self.ALPHABET) else None
+                    if letter != expected:
+                        violations.append(
+                            Violation(
+                                rule_name=rule_name,
+                                severity=Severity.WARNING,
+                                location=loc,
+                                message=f"Буквы приложений должны идти последовательно: "
+                                        f"после 'ПРИЛОЖЕНИЕ {prev_letter}' ожидается "
+                                        f"'ПРИЛОЖЕНИЕ {expected}', найдено 'ПРИЛОЖЕНИЕ {letter}'."
+                            )
+                        )
+                prev_letter = letter
+
+        # 2. Межстрочный интервал 1 у текста приложений (заголовки проверяются отдельно)
+        for offset, paragraph in enumerate(paragraphs[appendix_indices[0] + 1:], start=appendix_indices[0] + 1):
             text = paragraph.text.strip()
-            if not text:
+            if not text or re.match(self.HEADER_REGEX, text.upper()):
                 continue
 
             p_loc = f"Приложение (абзац {offset + 1}: '{text[:30]}...')"
 
-            for r_idx, run in enumerate(paragraph.runs, start=1):
-                if not run.text.strip():
-                    continue
-                font_size = self._get_effective_font_size(run, paragraph)
-                if font_size and abs(font_size - 12.0) > 0.1:
-                    violations.append(
-                        Violation(
-                            rule_name=rule_name,
-                            severity=Severity.WARNING,
-                            location=f"{p_loc}, фрагмент {r_idx}",
-                            message=f"Размер шрифта в приложении {font_size} pt, а допустим 12 pt."
-                        )
-                    )
-
-            line_sp = paragraph.paragraph_format.line_spacing
-            if line_sp is None and paragraph.style and paragraph.style.paragraph_format:
-                line_sp = paragraph.style.paragraph_format.line_spacing
+            line_sp = effective(paragraph, 'line_spacing')
             if line_sp is not None and abs(float(line_sp) - 1.0) > 0.05:
                 violations.append(
                     Violation(
@@ -1663,23 +1916,22 @@ class AppendixFormatRule(BaseRule):
                     )
                 )
 
-        # 3. Страницы приложения не нумеруются
-        section_indices = self._get_paragraph_section_indices(doc)
-        if appendix_idx < len(section_indices):
-            appendix_section = section_indices[appendix_idx]
-            if appendix_section > 0:  # Если приложение в первой секции — отделить нумерацию нельзя
-                for sec_idx, section in enumerate(doc.sections):
-                    if sec_idx < appendix_section:
-                        continue
-                    if self._has_page_number_field(section.header):
-                        violations.append(
-                            Violation(
-                                rule_name=rule_name,
-                                severity=Severity.ERROR,
-                                location=f"Секция {sec_idx + 1} (Верхний колонтитул)",
-                                message="В приложении страницы не должны нумероваться."
-                            )
+        # 3. Страницы приложений не нумеруются (ни в верхнем, ни в нижнем колонтитуле)
+        appendix_section = section_indices[appendix_indices[0]]
+        for sec_idx, section in enumerate(doc.sections):
+            if sec_idx < appendix_section:
+                continue
+            for holder, label in [(section.header, 'Верхний колонтитул'),
+                                  (section.footer, 'Нижний колонтитул')]:
+                if self._has_page_number_field(holder):
+                    violations.append(
+                        Violation(
+                            rule_name=rule_name,
+                            severity=Severity.ERROR,
+                            location=f"Секция {sec_idx + 1} ({label})",
+                            message="В приложении страницы не должны нумероваться."
                         )
+                    )
 
         return violations
 
@@ -1702,16 +1954,12 @@ class FiguresRule(BaseRule):
         return 'inline'
 
     def _is_centered(self, paragraph) -> bool:
-        align = paragraph.alignment
-        if align is None and paragraph.style and paragraph.style.paragraph_format:
-            align = paragraph.style.paragraph_format.alignment
+        align = effective(paragraph, 'alignment')
         return align == WD_ALIGN_PARAGRAPH.CENTER
 
     def _has_red_line(self, paragraph) -> bool:
-        indent = paragraph.paragraph_format.first_line_indent
-        if indent is None and paragraph.style and paragraph.style.paragraph_format:
-            indent = paragraph.style.paragraph_format.first_line_indent
-        return indent is not None and indent.cm > 0.05
+        indent = effective(paragraph, 'first_line_indent')
+        return indent is not None and abs(indent.cm - 1.25) <= 0.05
 
     def check(self, doc: Document) -> List[Violation]:
         violations: List[Violation] = []
@@ -1823,17 +2071,10 @@ class FiguresRule(BaseRule):
                         )
                     )
 
-            # Ссылка без 'см.': '(рис. 5)' вместо '(см.рис. 5)'
+            # Ссылка без 'см.': '(рис. 5)' — допустимая форма ссылки, также учитывается
             cleaned = self.REF_REGEX.sub('', text)
             for match in self.PLAIN_REF_REGEX.finditer(cleaned):
-                violations.append(
-                    Violation(
-                        rule_name=rule_name,
-                        severity=Severity.WARNING,
-                        location=f"Абзац {idx + 1} ('{text.strip()[:30]}...')",
-                        message=f"Ссылка на рисунок должна иметь вид '(см.рис. {match.group(1)})'."
-                    )
-                )
+                referenced_numbers.append(int(match.group(1)))
 
         # 4. Соответствие ссылок и подписей
         for num in sorted(set(referenced_numbers)):
@@ -1858,15 +2099,15 @@ class FiguresRule(BaseRule):
                     )
                 )
 
-        # 5. Сквозная нумерация рисунков
+        # 5. Сквозная нумерация рисунков с 1 без пропусков
         expected = list(range(1, len(caption_numbers) + 1))
         if sorted(caption_numbers) != expected and caption_numbers:
             violations.append(
                 Violation(
                     rule_name=rule_name,
-                    severity=Severity.WARNING,
+                    severity=Severity.ERROR,
                     location="Документ",
-                    message=f"Нумерация рисунков должна быть сквозной начиная с 1 (найдены: {sorted(caption_numbers)})."
+                    message=f"Нумерация рисунков должна быть сквозной начиная с 1 без пропусков (найдены: {sorted(caption_numbers)})."
                 )
             )
 
@@ -1905,23 +2146,14 @@ class TablesFormatRule(BaseRule):
         return items
 
     def _get_effective_font_name(self, run, paragraph) -> Optional[str]:
-        if run.font.name:
-            return run.font.name
-        if paragraph.style and paragraph.style.font and paragraph.style.font.name:
-            return paragraph.style.font.name
-        return None
+        return effective(paragraph, 'name', run)
 
     def _get_effective_font_size(self, run, paragraph) -> Optional[float]:
-        if run.font.size:
-            return run.font.size.pt
-        if paragraph.style and paragraph.style.font and paragraph.style.font.size:
-            return paragraph.style.font.size.pt
-        return None
+        size = effective(paragraph, 'size', run)
+        return size.pt if size is not None else None
 
     def _is_centered(self, paragraph) -> bool:
-        align = paragraph.alignment
-        if align is None and paragraph.style and paragraph.style.paragraph_format:
-            align = paragraph.style.paragraph_format.alignment
+        align = effective(paragraph, 'alignment')
         return align == WD_ALIGN_PARAGRAPH.CENTER
 
     def _has_red_line(self, paragraph) -> bool:
@@ -2083,26 +2315,78 @@ class TablesFormatRule(BaseRule):
                     )
                 )
 
-            # Названия столбцов (первая строка) — по центру по горизонтали и вертикали
+            # Ячейки данных: числовые — по центру, текстовые — по левому краю (WARN)
+            numeric_regex = re.compile(r'^[+-]?\d+(?:[.,]\d+)?$')
+            bad_numeric = []
+            bad_text = []
+            for row in table.rows[1:]:
+                for cell in row.cells:
+                    for cell_para in cell.paragraphs:
+                        text = cell_para.text.strip()
+                        if not text:
+                            continue
+                        align = effective(cell_para, 'alignment')
+                        if align is None:
+                            align = WD_ALIGN_PARAGRAPH.LEFT  # отсутствие jc означает левый край
+                        compact = text.replace(' ', '').replace('\xa0', '')
+                        if numeric_regex.fullmatch(compact):
+                            if align != WD_ALIGN_PARAGRAPH.CENTER:
+                                bad_numeric.append(text[:20])
+                        else:
+                            if align != WD_ALIGN_PARAGRAPH.LEFT:
+                                bad_text.append(text[:20])
+            if bad_numeric:
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.WARNING,
+                        location=table_loc,
+                        message=f"Числовые ячейки таблицы должны быть выровнены по центру "
+                                f"(обнаружено проблем: {len(bad_numeric)}, например: {', '.join(bad_numeric[:3])})."
+                    )
+                )
+            if bad_text:
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.WARNING,
+                        location=table_loc,
+                        message=f"Текстовые ячейки таблицы должны быть выровнены по левому краю "
+                                f"(обнаружено проблем: {len(bad_text)}, например: {', '.join(bad_text[:3])})."
+                    )
+                )
+
+            # Шапка (первая строка): по центру по горизонтали (jc) и вертикали (vAlign)
             if table.rows:
-                bad_header = []
+                bad_horizontal = []
+                bad_vertical = []
                 for cell in table.rows[0].cells:
                     cell_para = cell.paragraphs[0] if cell.paragraphs else None
                     if cell_para is None:
                         continue
-                    align = cell_para.alignment
-                    if align is None and cell_para.style and cell_para.style.paragraph_format:
-                        align = cell_para.style.paragraph_format.alignment
-                    if align != WD_ALIGN_PARAGRAPH.CENTER or cell.vertical_alignment != WD_ALIGN_VERTICAL.CENTER:
-                        bad_header.append(cell.text.strip()[:20])
-                if bad_header:
+                    align = effective(cell_para, 'alignment')
+                    if align != WD_ALIGN_PARAGRAPH.CENTER:
+                        bad_horizontal.append(cell.text.strip()[:20])
+                    if cell.vertical_alignment != WD_ALIGN_VERTICAL.CENTER:
+                        bad_vertical.append(cell.text.strip()[:20])
+                if bad_horizontal:
                     violations.append(
                         Violation(
                             rule_name=rule_name,
-                            severity=Severity.WARNING,
+                            severity=Severity.ERROR,
                             location=table_loc,
-                            message=f"Названия столбцов должны быть выровнены по центру "
-                                    f"(по горизонтали и вертикали); проблемы в: {', '.join(bad_header[:3])}."
+                            message=f"Названия столбцов должны быть выровнены по центру по горизонтали (jc); "
+                                    f"проблемы в: {', '.join(bad_horizontal[:3])}."
+                        )
+                    )
+                if bad_vertical:
+                    violations.append(
+                        Violation(
+                            rule_name=rule_name,
+                            severity=Severity.ERROR,
+                            location=table_loc,
+                            message=f"Названия столбцов должны быть выровнены по центру по вертикали (vAlign); "
+                                    f"проблемы в: {', '.join(bad_vertical[:3])}."
                         )
                     )
 
@@ -2165,6 +2449,7 @@ class TablesFormatRule(BaseRule):
 
 class FormulasRule(BaseRule):
     NUMBERING_REGEX = re.compile(r'\((\d+)\)\s*$')
+    M_JC_REGEX = re.compile(r'<m:jc\s+m:val="([^"]+)"')
 
     def _is_display_formula(self, paragraph) -> bool:
         """Выносная формула: oMathPara либо короткий абзац с oMath."""
@@ -2175,6 +2460,16 @@ class FormulasRule(BaseRule):
             return True
         text = self.NUMBERING_REGEX.sub('', paragraph.text).strip()
         return len(text) <= 25
+
+    def _is_centered(self, paragraph) -> bool:
+        """Формула центрирована: jc абзаца либо m:jc выносной формулы (по умолчанию centerGroup)."""
+        if effective(paragraph, 'alignment') == WD_ALIGN_PARAGRAPH.CENTER:
+            return True
+        xml = paragraph._element.xml
+        if '<m:oMathPara' in xml:
+            match = self.M_JC_REGEX.search(xml)
+            return match is None or match.group(1) in ('center', 'centerGroup')
+        return False
 
     def check(self, doc: Document) -> List[Violation]:
         violations: List[Violation] = []
@@ -2195,11 +2490,8 @@ class FormulasRule(BaseRule):
             text = paragraph.text.strip()
             loc = f"Формула (абзац {idx + 1}: '{text[:30]}')"
 
-            # 1. Формула выравнивается по центру
-            align = paragraph.alignment
-            if align is None and paragraph.style and paragraph.style.paragraph_format:
-                align = paragraph.style.paragraph_format.alignment
-            if align != WD_ALIGN_PARAGRAPH.CENTER:
+            # 1. Формула выравнивается по центру (jc абзаца или m:jc oMathPara)
+            if not self._is_centered(paragraph):
                 violations.append(
                     Violation(
                         rule_name=rule_name,
@@ -2209,8 +2501,8 @@ class FormulasRule(BaseRule):
                     )
                 )
 
-            # 2. Справа проставляется нумерация, например (1)
-            match = self.NUMBERING_REGEX.search(text)
+            # 2. Справа проставляется нумерация, например (1); номер может быть и в m:t
+            match = self.NUMBERING_REGEX.search(full_text(paragraph).strip())
             if match:
                 formula_numbers.append(int(match.group(1)))
             else:
@@ -2224,20 +2516,21 @@ class FormulasRule(BaseRule):
                 )
 
             # 3. Перед формулой описание, заканчивающееся двоеточием
+            #    (в предыдущем абзаце либо в этом же абзаце перед формулой)
             prev_idx = idx - 1
             while prev_idx >= 0 and (not paragraphs[prev_idx].text.strip() or prev_idx in formula_indices):
                 prev_idx -= 1
-            if prev_idx >= 0:
-                prev_text = paragraphs[prev_idx].text.strip()
-                if not prev_text.endswith(':'):
-                    violations.append(
-                        Violation(
-                            rule_name=rule_name,
-                            severity=Severity.WARNING,
-                            location=loc,
-                            message="Перед формулой должно быть описание, заканчивающееся двоеточием."
-                        )
+            own_text = self.NUMBERING_REGEX.sub('', full_text(paragraph)).strip()
+            prev_ok = prev_idx >= 0 and paragraphs[prev_idx].text.strip().endswith(':')
+            if not prev_ok and not own_text.endswith(':'):
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.WARNING,
+                        location=loc,
+                        message="Перед формулой должно быть описание, заканчивающееся двоеточием."
                     )
+                )
 
             # 4. После формулы описываются примененные обозначения
             next_idx = idx + 1
@@ -2274,6 +2567,8 @@ class ListsFormatRule(BaseRule):
     DOT_ITEM_REGEX = re.compile(r'^(\d+)\.\s+(.+)$')
 
     INDENT_TOLERANCE_CM = 0.15
+    # Допустимые маркеры авто-списков (только тире)
+    NUMBERING_DASHES = ('–', '-', '—')
 
     @staticmethod
     def _item_kind(text: str):
@@ -2297,6 +2592,123 @@ class ListsFormatRule(BaseRule):
         if indent is None and paragraph.style and paragraph.style.paragraph_format:
             indent = paragraph.style.paragraph_format.first_line_indent
         return indent
+
+    @staticmethod
+    def _num_pr(paragraph):
+        """(numId, ilvl) прямого w:numPr абзаца или None."""
+        num_pr = paragraph._p.xpath('./w:pPr/w:numPr')
+        if not num_pr:
+            return None
+        num_id = num_pr[0].xpath('./w:numId/@w:val')
+        if not num_id:
+            return None
+        ilvl = num_pr[0].xpath('./w:ilvl/@w:val')
+        return int(num_id[0]), int(ilvl[0]) if ilvl else 0
+
+    @staticmethod
+    def _numbering_level(doc, num_id: int, ilvl: int):
+        """w:lvl уровня списка из numbering.xml (numId -> abstractNumId -> lvl) или None."""
+        try:
+            numbering = doc.part.numbering_part.element
+        except Exception:
+            return None
+        for num in numbering.iter(qn('w:num')):
+            if num.get(qn('w:numId')) == str(num_id):
+                abstract = num.find(qn('w:abstractNumId'))
+                if abstract is None:
+                    return None
+                abstract_id = abstract.get(qn('w:val'))
+                for candidate in numbering.iter(qn('w:abstractNum')):
+                    if candidate.get(qn('w:abstractNumId')) == abstract_id:
+                        for lvl in candidate.iter(qn('w:lvl')):
+                            if lvl.get(qn('w:ilvl')) == str(ilvl):
+                                return lvl
+                return None
+        return None
+
+    def _check_auto_item(self, doc, paragraphs, idx, num_id, ilvl, is_last, violations):
+        """Проверка пункта авто-списка Word (номер/маркер генерируются автоматически)."""
+        rule_name = "ListsFormatRule"
+        paragraph = paragraphs[idx]
+        text = paragraph.text.strip()
+        loc = f"Абзац {idx + 1} ('{text[:30]}...')"
+
+        lvl = self._numbering_level(doc, num_id, ilvl)
+        if lvl is None:
+            return  # numbering.xml или уровень недоступны — проверять нечего
+
+        fmt_node = lvl.find(qn('w:numFmt'))
+        text_node = lvl.find(qn('w:lvlText'))
+        num_fmt = fmt_node.get(qn('w:val')) if fmt_node is not None else None
+        lvl_text = text_node.get(qn('w:val')) if text_node is not None else None
+
+        if num_fmt in (None, 'none'):
+            return  # numFmt other/none — пропуск
+
+        if num_fmt == 'bullet':
+            if lvl_text not in self.NUMBERING_DASHES:
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.ERROR,
+                        location=loc,
+                        message=f"Маркер списка должен быть тире (–), а не '{lvl_text}'."
+                    )
+                )
+        elif num_fmt == 'decimal':
+            last_char = text[-1:]
+            if lvl_text == '%1)':
+                expected = '.' if is_last else ';'
+                if last_char != expected:
+                    violations.append(
+                        Violation(
+                            rule_name=rule_name,
+                            severity=Severity.WARNING,
+                            location=loc,
+                            message=f"В списке с нумерацией 'N)' пункт должен заканчиваться "
+                                    f"{'точкой (последний)' if is_last else 'точкой с запятой'}."
+                        )
+                    )
+            elif lvl_text == '%1.':
+                if last_char != '.':
+                    violations.append(
+                        Violation(
+                            rule_name=rule_name,
+                            severity=Severity.WARNING,
+                            location=loc,
+                            message="В списке с нумерацией 'N.' пункт должен заканчиваться точкой."
+                        )
+                    )
+
+        # Отступ: left = 0/отсутствует и красная строка 1.75 см
+        left = effective(paragraph, 'left_indent')
+        first = effective(paragraph, 'first_line_indent')
+        if left is None and first is None:
+            level_ppr = lvl.find(qn('w:pPr'))
+            ind = level_ppr.find(qn('w:ind')) if level_ppr is not None else None
+            if ind is not None:
+                from docx.shared import Twips
+                left_val = ind.get(qn('w:left')) or ind.get(qn('w:start'))
+                hang_val = ind.get(qn('w:hanging'))
+                first_val = ind.get(qn('w:firstLine'))
+                if left_val is not None:
+                    left = Twips(int(left_val))
+                if hang_val is not None:
+                    first = Twips(-int(hang_val))
+                elif first_val is not None:
+                    first = Twips(int(first_val))
+        left_cm = left.cm if left is not None else 0.0
+        first_cm = first.cm if first is not None else 0.0
+        if abs(left_cm) > self.INDENT_TOLERANCE_CM or abs(first_cm - 1.75) > self.INDENT_TOLERANCE_CM:
+            violations.append(
+                Violation(
+                    rule_name=rule_name,
+                    severity=Severity.WARNING,
+                    location=loc,
+                    message=f"Отступ авто-списка: левый 0 см и красная строка 1.75 см "
+                            f"(фактически: левый {round(left_cm, 2)} см, красная строка {round(first_cm, 2)} см)."
+                )
+            )
 
     def _check_item(self, paragraphs, idx, kind, is_last, violations):
         rule_name = "ListsFormatRule"
@@ -2407,6 +2819,7 @@ class ListsFormatRule(BaseRule):
             return align == WD_ALIGN_PARAGRAPH.CENTER
 
         item_indices = set()
+        auto_map = {}
         for idx, p in enumerate(paragraphs):
             if getattr(p, 'is_title_page', False) or getattr(p, 'is_toc', False):
                 continue
@@ -2418,8 +2831,26 @@ class ListsFormatRule(BaseRule):
                 break
             if is_centered(p):
                 continue
-            if self._item_kind(text):
+            num_pr = self._num_pr(p)
+            if num_pr is not None:
+                auto_map[idx] = num_pr
+            elif self._item_kind(text):
                 item_indices.add(idx)
+
+        # Авто-списки Word (номер генерируется через numPr/numbering.xml)
+        for idx in sorted(auto_map):
+            paragraph = paragraphs[idx]
+            num_id, ilvl = auto_map[idx]
+            if ilvl != 0:
+                continue  # вложенные уровни не проверяются
+
+            next_item_idx = idx + 1
+            while next_item_idx < len(paragraphs) and not paragraphs[next_item_idx].text.strip():
+                next_item_idx += 1
+            is_last = not (next_item_idx in auto_map and auto_map[next_item_idx][0] == num_id
+                           and auto_map[next_item_idx][1] == ilvl)
+
+            self._check_auto_item(doc, paragraphs, idx, num_id, ilvl, is_last, violations)
 
         for idx in sorted(item_indices):
             paragraph = paragraphs[idx]

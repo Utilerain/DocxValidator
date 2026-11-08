@@ -16,24 +16,11 @@ class DocxValidator:
             violations.extend(rule.check(doc))
         return violations
 
-parser = ArgumentParser(description="Проверяет Word документ на правила, указанные на написание документации или диплома")
-parser.add_argument("input_file", help="Путь до Word документа")
-parser.add_argument("--make-notes", action="store_true",
-                    help="Создать рядом копию документа с замечаниями в виде комментариев Word (оригинал не изменяется)")
-parser.add_argument("--create-fixed", action="store_true",
-                    help="Создать рядом исправленную версию документа по требованиям оформления (оригинал не изменяется)")
-parser.print_help()
-
-if __name__ == "__main__":
-    args = parser.parse_args()
-
-    print("".rjust(70, "-"))
-    print()
-    print("DocxValidator".rjust(40, " "))
-    print()
-    print("".rjust(70, "-"))
-    validator = DocxValidator(rules=[
+def default_rules():
+    return [
         PageMarginsRule(),
+        TextGridRule(),
+        TableOfContentsRule(),
         MainTextFormatRule(),
         PageNumberingRule(),
         TitlePageRule(),
@@ -48,11 +35,31 @@ if __name__ == "__main__":
         TablesFormatRule(),
         FormulasRule(),
         ListsFormatRule(),
-        DashesRule(),
-        WhiteFillRule()
-    ])
+        DashesRule()
+    ]
+
+if __name__ == "__main__":
+    parser = ArgumentParser(description="Проверяет Word документ на правила, указанные на написание документации или диплома")
+    parser.add_argument("input_file", help="Путь до Word документа")
+    args = parser.parse_args()
+
+    print("".rjust(70, "-"))
+    print()
+    print("DocxValidator".rjust(40, " "))
+    print()
+    print("".rjust(70, "-"))
+    validator = DocxValidator(default_rules())
     docx_path = Path(args.input_file)
-    report = validator.validate(str(docx_path.absolute()))
+    if not docx_path.is_file():
+        print_color(f"Файл не найден: {docx_path.absolute()}", Fore.RED)
+        __import__("sys").exit(2)
+    try:
+        report = validator.validate(str(docx_path.absolute()))
+    except Exception as error:
+        print_color(f"Не удалось открыть или разобрать документ '{docx_path}': "
+                    f"{type(error).__name__}: {error}", Fore.RED)
+        print_color("Убедитесь, что это корректный файл Word (.docx), и он не поврежден.", Fore.RED)
+        __import__("sys").exit(2)
     if report == []:
         print_color("Все в норме!", Fore.GREEN)
         if args.make_notes:
