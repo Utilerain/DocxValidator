@@ -244,7 +244,8 @@ class IntegrationTests(unittest.TestCase):
             importlib.reload(main)
         self.assertEqual('', output.getvalue())
         rules = main.default_rules()
-        self.assertEqual(1, sum(isinstance(r, TextGridRule) for r in rules))
+        # TextGridRule не входит в требования МДК 04.01 и в стандартный набор
+        self.assertEqual(0, sum(isinstance(r, TextGridRule) for r in rules))
         self.assertEqual(1, sum(isinstance(r, TableOfContentsRule) for r in rules))
 
     def test_toc_stops_at_chapter_and_spacing(self):
@@ -267,7 +268,7 @@ class IntegrationTests(unittest.TestCase):
         path = Path(__file__).resolve().parents[1] / 'docs' / 'test.docx'
         before = hashlib.sha256(path.read_bytes()).digest()
         report = DocxValidator(default_rules()).validate(str(path))
-        self.assertTrue(any(v.rule_name == 'TextGridRule' and v.severity == Severity.ERROR for v in report))
+        self.assertTrue(report)  # тестовый документ не соответствует требованиям
         self.assertEqual(before, hashlib.sha256(path.read_bytes()).digest())
 
 

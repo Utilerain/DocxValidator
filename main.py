@@ -19,7 +19,6 @@ class DocxValidator:
 def default_rules():
     return [
         PageMarginsRule(),
-        TextGridRule(),
         TableOfContentsRule(),
         MainTextFormatRule(),
         PageNumberingRule(),
