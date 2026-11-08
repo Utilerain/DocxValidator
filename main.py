@@ -35,12 +35,17 @@ def default_rules():
         TablesFormatRule(),
         FormulasRule(),
         ListsFormatRule(),
-        DashesRule()
+        DashesRule(),
+        WhiteFillRule()
     ]
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Проверяет Word документ на правила, указанные на написание документации или диплома")
     parser.add_argument("input_file", help="Путь до Word документа")
+    parser.add_argument("--make-notes", action="store_true",
+                        help="Создать рядом копию документа с замечаниями в виде комментариев Word (оригинал не изменяется)")
+    parser.add_argument("--create-fixed", action="store_true",
+                        help="Создать рядом исправленную версию документа по требованиям оформления (оригинал не изменяется)")
     args = parser.parse_args()
 
     print("".rjust(70, "-"))
@@ -90,12 +95,5 @@ if __name__ == "__main__":
         fixed_report = validator.validate(str(fixed_path))
         print_color(f"Нарушений было: {len(report)}, в исправленной версии осталось: {len(fixed_report)}", Fore.CYAN)
 
-    print_color("Внимание! Программа может ошибаться в поиске ошибок в формате документа! Если вы считаете, что нарушения ошибочны, то можете спокойно игнорировать", Fore.CYAN)
-    __import__("sys").exit(1)
-
-    print_color(f"Найдено нарушений: {len(report)}\n", Fore.RED)
-    for item in report:
-        print_color(f"[{item.severity.value}] {item.rule_name} | {item.location}", Fore.RED if item.severity.value == "ERR" else Fore.YELLOW)
-        print(f"    -> {item.message}")
     print_color("Внимание! Программа может ошибаться в поиске ошибок в формате документа! Если вы считаете, что нарушения ошибочны, то можете спокойно игнорировать", Fore.CYAN)
     __import__("sys").exit(1)
