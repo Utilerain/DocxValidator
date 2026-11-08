@@ -35,8 +35,11 @@ def is_toc_line(text: str) -> bool:
 def classify_paragraphs(doc: Document) -> List:
     """Эвристическая разметка: отсутствие оглавления не скрывает весь текст."""
     classified = list(doc.paragraphs)
+    # Титульный лист заканчивается на первом «словесном» заголовке (Содержание,
+    # Введение, Глава...). Числовой шаблон is_heading сюда не подходит — иначе
+    # код специальности «09.02.07. …» на титуле обрывает титульный лист.
     first = next((i for i, p in enumerate(classified)
-                  if is_heading(p.text.strip()) and not is_toc_line(p.text)), 0)
+                  if is_word_heading(p.text.strip()) and not is_toc_line(p.text)), 0)
     in_toc = in_appendix = False
     for i, p in enumerate(classified):
         text = p.text.strip()
@@ -177,6 +180,16 @@ def paragraph_section_indices(doc: Document) -> List[int]:
 
 def is_heading(text):
     return bool(re.match(r'^(?:ГЛАВА\s+\d+|\d+(?:\.\d+)+\.?\s+|'
+                         r'(?:СОДЕРЖАНИЕ|ОГЛАВЛЕНИЕ|ВВЕДЕНИЕ|ЗАКЛЮЧЕНИЕ|БИБЛИОГРАФИЯ)$|'
+                         r'СПИСОК\s+(?:ИСТОЧНИКОВ|ЛИТЕРАТУРЫ|ИСПОЛЬЗОВАННЫХ)|ПРИЛОЖЕНИЕ\b)', text, re.I))
+
+
+def is_word_heading(text):
+    """
+    Заголовок, основанный на словах. Числовые шаблоны («2.1.», код специальности
+    «09.02.07. …» на титульном листе) исключены: они не должны обрывать титульный лист.
+    """
+    return bool(re.match(r'^(?:ГЛАВА\s+\d+|'
                          r'(?:СОДЕРЖАНИЕ|ОГЛАВЛЕНИЕ|ВВЕДЕНИЕ|ЗАКЛЮЧЕНИЕ|БИБЛИОГРАФИЯ)$|'
                          r'СПИСОК\s+(?:ИСТОЧНИКОВ|ЛИТЕРАТУРЫ|ИСПОЛЬЗОВАННЫХ)|ПРИЛОЖЕНИЕ\b)', text, re.I))
 
