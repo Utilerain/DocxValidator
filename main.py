@@ -5,6 +5,10 @@ from argparse import ArgumentParser, Namespace
 from colors import print_color
 from pathlib import Path
 from colorama import Fore
+from typing import List
+
+from docx import Document
+from tqdm import tqdm
 
 class DocxValidator:
     def __init__(self, rules: List[BaseRule]) -> None:
