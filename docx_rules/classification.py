@@ -9,6 +9,13 @@ from docx.oxml.ns import qn
 from docx_rules.helpers import is_heading, is_toc_line, is_word_heading, style_chain
 
 
+# Заголовок приложения: «ПРИЛОЖЕНИЕ», «Приложение А», «Приложение А. Название»,
+# «Приложение 1», «Приложение — Название». Фразы внутри текста («Приложение
+# предназначено для …») раздел приложений не начинают.
+APPENDIX_START_REGEX = re.compile(
+    r'^ПРИЛОЖЕНИЕ(?:\s*$|\s+(?:[А-ЯЁA-Z]\b\.?|\d+\b)|\s*[-–—:])', re.I)
+
+
 def classify_paragraphs(doc: Document) -> List:
     """Эвристическая разметка: отсутствие оглавления не скрывает весь текст."""
     classified = list(doc.paragraphs)
@@ -75,7 +82,8 @@ def classify_paragraphs(doc: Document) -> List:
         title_name = (first == 0 and re.match(r'^ПРИЛОЖЕНИЕ\s*[«"“]', text, re.I)
                       and any(re.match(r'^УТВЕРЖДЕНО\b', q.text.strip(), re.I)
                               for q in classified[:i]))
-        if not p.is_toc and i >= first and not title_name and re.match(r'^ПРИЛОЖЕНИЕ\b', text, re.I):
+        if (not p.is_toc and i >= first and not title_name
+                and APPENDIX_START_REGEX.match(text)):
             in_appendix = True
         p.is_appendix = in_appendix
         p.is_special = (is_heading(text) or in_appendix

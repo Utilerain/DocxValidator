@@ -8,11 +8,13 @@ from typing import List
 
 from docx_rules.base import BaseRule, Severity, Violation
 from docx_rules.helpers import effective, has_page_field, paragraph_section_indices
-from docx_rules.classification import classify_paragraphs
+from docx_rules.classification import APPENDIX_START_REGEX, classify_paragraphs
 
 
 class AppendixFormatRule(BaseRule):
-    HEADER_REGEX = r'^ПРИЛОЖЕНИЕ'
+    # Только настоящий заголовок приложения («Приложение А», «ПРИЛОЖЕНИЕ»),
+    # а не фраза в тексте («Приложение предназначено для …»).
+    HEADER_REGEX = APPENDIX_START_REGEX
     LETTER_REGEX = re.compile(r'^ПРИЛОЖЕНИЕ\s+([А-Я])\b')
     # Русский алфавит без Ё — порядок букв приложений по ГОСТ 7.32
     ALPHABET = 'АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ'
