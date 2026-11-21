@@ -106,6 +106,9 @@ def tz_34_602_rules() -> List[BaseRule]:
         Tz34StructureRule(),
         Tz34TextFormatRule(),
         BreaksAndPaginationRule(),
+        # Списки в образце — автоматические, тире «–» на красной строке 1,25 см;
+        # ручные «N. …» не проверяются: одноуровневые «N. …» в ТЗ — заголовки разделов.
+        ListsFormatRule(auto_dash_indent_cm=1.25, manual_indent_cm=1.25, check_manual_items=False),
         DashesRule(),
         FiguresRule(),
         TablesFormatRule(require_header_repeat=False),
