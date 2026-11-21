@@ -99,6 +99,29 @@ class TableNumbersRowTests(unittest.TestCase):
         joined = ' '.join(self.messages(doc))
         self.assertIn('Если таблица выходит за пределы одной страницы', joined)
 
+    def test_unneeded_numbers_on_single_page_table_are_reported(self):
+        doc = make_doc()
+        add_labeled_table(doc, [['Стадия', 'Работы'], ['1', '2'],
+                                ['А', 'Б'], ['В', 'Г']])
+        joined = ' '.join(self.messages(doc))
+        self.assertIn('Цифры под шапкой не нужны', joined)
+
+    def test_numbers_on_table_beyond_page_are_kept(self):
+        doc = make_doc()
+        add_labeled_table(doc, [['Стадия', 'Работы'], ['1', '2']]
+                          + [[f'Этап {i}', 'Разработка и отладка модулей системы'] for i in range(1, 31)])
+        joined = ' '.join(self.messages(doc))
+        self.assertNotIn('Цифры под шапкой не нужны', joined)
+
+    def test_numbers_on_split_table_are_kept(self):
+        # Основная часть с «Продолжением» умещается на странице, но логическая
+        # таблица целиком — нет: нумерация граф обязательна.
+        doc = make_doc()
+        add_labeled_table(doc, [['Стадия', 'Работы'], ['1', '2'], ['А', 'Б']])
+        add_continuation(doc, [['1', '2'], ['Д', 'Е']])
+        joined = ' '.join(self.messages(doc))
+        self.assertNotIn('Цифры под шапкой не нужны', joined)
+
     def test_short_single_table_without_numbers_passes(self):
         doc = make_doc()
         add_labeled_table(doc, [['Стадия', 'Работы'], ['А', 'Б'], ['В', 'Г']])

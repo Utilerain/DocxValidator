@@ -23,11 +23,13 @@ class TablesFormatRule(BaseRule):
 
     # Оценка высоты таблицы: строка 14 пт при одинарном интервале и средняя
     # ширина символа Times New Roman 14 пт. Грубые значения — нужен только
-    # признак «таблица заведомо не влезает в страницу».
+    # признак «таблица заведомо не влезает в страницу» или, наоборот,
+    # «таблица заведомо умещается».
     LINE_HEIGHT_CM = 0.6
     CHAR_WIDTH_CM = 0.25
     CELL_PADDING_CM = 0.2
     HEIGHT_SHARE = 0.85
+    FIT_SHARE = 0.55
 
     def __init__(self, target_font_name: str = "Times New Roman", target_font_size: float = 14.0,
                  require_header_repeat: bool = True):
@@ -185,6 +187,13 @@ class TablesFormatRule(BaseRule):
         if not area:
             return False
         return self._estimate_height_cm(doc, table) > area[0] * self.HEIGHT_SHARE
+
+    def _estimated_fits_page(self, doc: Document, table) -> bool:
+        """True, если таблица заведомо умещается на одной странице целиком."""
+        area = self._usable_area_cm(doc)
+        if not area:
+            return False
+        return self._estimate_height_cm(doc, table) <= area[0] * self.FIT_SHARE
 
     def _check_numbers_sequence(self, values, location, violations):
         if values != list(range(1, len(values) + 1)):
@@ -464,8 +473,9 @@ class TablesFormatRule(BaseRule):
         # пределы одной страницы (см. образец ТЗ): после шапки основной части
         # и в части «Продолжение таблицы N». Выход за страницу достоверен при
         # наличии «Продолжения», у одиночной длинной таблицы — оценкой высоты.
-        # Обратное (нумерация у умещающейся таблицы) не проверяем: начальную
-        # позицию таблицы на странице по XML не определить.
+        # Обратная норма тоже проверяется: у таблицы, умещающейся на одной
+        # странице, цифр под шапкой быть не должно (позицию на странице видно
+        # только по грубой оценке высоты, поэтому — предупреждение).
         continuation_nums = {num for num, _ in continuation_tables}
         for num, table in main_tables.items():
             values = self._numbers_row_values(table, start=1)
@@ -486,6 +496,12 @@ class TablesFormatRule(BaseRule):
                         "Если таблица выходит за пределы одной страницы, после шапки нужна "
                         "строка с нумерацией граф (1, 2, …), как в образце."))
             else:
+                if num not in continuation_nums and self._estimated_fits_page(doc, table):
+                    violations.append(Violation(
+                        "TablesFormatRule", Severity.WARNING, f"Таблица {num}",
+                        "Цифры под шапкой не нужны: таблица умещается на одной странице. "
+                        "Нумерация граф (1, 2, …) ставится, только если таблица выходит "
+                        "за пределы страницы."))
                 self._check_numbers_sequence(values, f"Таблица {num}", violations)
         for num, table in continuation_tables:
             values = (self._numbers_row_values(table, start=0)
