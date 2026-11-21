@@ -1,5 +1,6 @@
 """Проверка оформления таблиц."""
 
+import math
 import re
 
 from docx import Document
@@ -19,6 +20,14 @@ class TablesFormatRule(BaseRule):
     REF_REGEX = re.compile(r'\(\s*см\.\s*табл\.?\s*(\d+)\s*\)', re.IGNORECASE)
     NATURAL_REF_REGEX = re.compile(r'(?<![\w(])в\s+таблице\s+(\d+)\b', re.IGNORECASE)
     REQUIRED_BORDERS = ('top', 'left', 'bottom', 'right', 'insideH', 'insideV')
+
+    # Оценка высоты таблицы: строка 14 пт при одинарном интервале и средняя
+    # ширина символа Times New Roman 14 пт. Грубые значения — нужен только
+    # признак «таблица заведомо не влезает в страницу».
+    LINE_HEIGHT_CM = 0.6
+    CHAR_WIDTH_CM = 0.25
+    CELL_PADDING_CM = 0.2
+    HEIGHT_SHARE = 0.85
 
     def __init__(self, target_font_name: str = "Times New Roman", target_font_size: float = 14.0,
                  require_header_repeat: bool = True):
@@ -110,6 +119,80 @@ class TablesFormatRule(BaseRule):
         header = tr_pr.find(qn('w:tblHeader'))
         return header is not None and header.get(qn('w:val'), 'true') not in ('0', 'false', 'off')
 
+    @staticmethod
+    def _numbers_row_values(table, start: int) -> Optional[List[int]]:
+        """Номера граф из строки вида «1 | 2 | …» (строка start) или None.
+
+        Строка считается нумерацией граф, если все её непустые ячейки —
+        целые числа и первая из них равна 1.
+        """
+        rows = table.rows
+        if len(rows) <= start:
+            return None
+        values = []
+        for cell in rows[start].cells:
+            text = cell.text.strip().replace('\xa0', ' ')
+            if not text:
+                continue
+            if not re.fullmatch(r'\d+', text):
+                return None
+            values.append(int(text))
+        if len(values) >= 2 and values[0] == 1:
+            return values
+        return None
+
+    def _usable_area_cm(self, doc: Document) -> Optional[tuple]:
+        section = doc.sections[0] if doc.sections else None
+        if section is None or section.page_height is None:
+            return None
+        return (section.page_height.cm - section.top_margin.cm - section.bottom_margin.cm,
+                section.page_width.cm - section.left_margin.cm - section.right_margin.cm)
+
+    def _estimate_height_cm(self, doc: Document, table) -> float:
+        """Грубая оценка отрисованной высоты таблицы, см (без разбивки на страницы)."""
+        widths = []
+        grid = table._tbl.find(qn('w:tblGrid'))
+        if grid is not None:
+            for column in grid.findall(qn('w:gridCol')):
+                try:
+                    widths.append(int(column.get(qn('w:w'))) / 567.0)  # twips -> см
+                except (TypeError, ValueError):
+                    widths.append(0.0)
+        area = self._usable_area_cm(doc)
+        fallback_width = area[1] if area else 17.0
+        total = 0.0
+        for row in table.rows:
+            row_height = 0.0
+            for idx, cell in enumerate(row.cells):
+                width = widths[idx] if idx < len(widths) and widths[idx] > 0.5 else fallback_width
+                text_width = max(width - 0.4, 1.0)
+                cell_height = 0.0
+                for cell_para in cell.paragraphs:
+                    text = cell_para.text.strip()
+                    if not text:
+                        continue
+                    spacing = effective(cell_para, 'line_spacing')
+                    factor = spacing if isinstance(spacing, float) else 1.0
+                    lines = max(1, math.ceil(len(text) * self.CHAR_WIDTH_CM / text_width))
+                    cell_height += lines * self.LINE_HEIGHT_CM * factor
+                row_height = max(row_height, cell_height)
+            total += row_height + self.CELL_PADDING_CM
+        return total
+
+    def _estimated_beyond_page(self, doc: Document, table) -> bool:
+        """True, если оценённая высота таблицы заведомо больше страницы."""
+        area = self._usable_area_cm(doc)
+        if not area:
+            return False
+        return self._estimate_height_cm(doc, table) > area[0] * self.HEIGHT_SHARE
+
+    def _check_numbers_sequence(self, values, location, violations):
+        if values != list(range(1, len(values) + 1)):
+            violations.append(Violation(
+                "TablesFormatRule", Severity.WARNING, location,
+                "Нумерация граф должна быть последовательной от 1 "
+                f"(найдено: {', '.join(map(str, values))})."))
+
     def check(self, doc: Document) -> List[Violation]:
         violations: List[Violation] = []
         rule_name = "TablesFormatRule"
@@ -131,6 +214,8 @@ class TablesFormatRule(BaseRule):
 
         labeled_numbers = []
         referenced_numbers = []
+        main_tables = {}
+        continuation_tables = []
 
         for pos, (kind, obj, obj_idx) in enumerate(items):
             if kind != 'tbl':
@@ -198,6 +283,7 @@ class TablesFormatRule(BaseRule):
                     "Первая строка таблицы должна быть помечена w:tblHeader для повторения шапки на следующих страницах."))
 
             if is_continuation:
+                continuation_tables.append((continuation_num, table))
                 continue  # Название для продолжения не требуется; общие свойства уже проверены
 
             if label_para is None:
@@ -212,6 +298,7 @@ class TablesFormatRule(BaseRule):
             else:
                 num = int(self.LABEL_REGEX.match(label_para.text.strip()).group(1))
                 labeled_numbers.append(num)
+                main_tables[num] = table
 
                 if label_para.alignment != WD_ALIGN_PARAGRAPH.RIGHT:
                     violations.append(
@@ -372,6 +459,43 @@ class TablesFormatRule(BaseRule):
                                     f"проблемы в: {', '.join(bad_vertical[:3])}."
                         )
                     )
+
+        # Строка нумерации граф («1 | 2 | …») нужна таблицам, выходящим за
+        # пределы одной страницы (см. образец ТЗ): после шапки основной части
+        # и в части «Продолжение таблицы N». Выход за страницу достоверен при
+        # наличии «Продолжения», у одиночной длинной таблицы — оценкой высоты.
+        # Обратное (нумерация у умещающейся таблицы) не проверяем: начальную
+        # позицию таблицы на странице по XML не определить.
+        continuation_nums = {num for num, _ in continuation_tables}
+        for num, table in main_tables.items():
+            values = self._numbers_row_values(table, start=1)
+            if values is None:
+                if num in continuation_nums:
+                    violations.append(Violation(
+                        "TablesFormatRule", Severity.ERROR, f"Таблица {num}",
+                        "Таблица выходит за пределы одной страницы (есть 'Продолжение "
+                        "таблицы N'): после шапки нужна строка с нумерацией граф (1, 2, …)."))
+                elif self._estimated_beyond_page(doc, table):
+                    violations.append(Violation(
+                        "TablesFormatRule", Severity.WARNING, f"Таблица {num}",
+                        "Таблица, вероятно, выходит за пределы одной страницы: после шапки "
+                        "нужна строка с нумерацией граф (1, 2, …), как в образце."))
+                elif len(table.rows) >= 5:
+                    violations.append(Violation(
+                        "TablesFormatRule", Severity.WARNING, f"Таблица {num}",
+                        "Если таблица выходит за пределы одной страницы, после шапки нужна "
+                        "строка с нумерацией граф (1, 2, …), как в образце."))
+            else:
+                self._check_numbers_sequence(values, f"Таблица {num}", violations)
+        for num, table in continuation_tables:
+            values = (self._numbers_row_values(table, start=0)
+                      or self._numbers_row_values(table, start=1))
+            if values is None:
+                violations.append(Violation(
+                    "TablesFormatRule", Severity.ERROR, f"Продолжение таблицы {num}",
+                    "В части 'Продолжение таблицы N' нужна строка с нумерацией граф (1, 2, …)."))
+            else:
+                self._check_numbers_sequence(values, f"Продолжение таблицы {num}", violations)
 
         # Ссылки на таблицы: (см.табл. N) в конце абзаца перед точкой
         for p_idx, paragraph in enumerate(paragraphs, start=1):
