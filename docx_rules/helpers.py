@@ -44,17 +44,73 @@ def style_chain(style):
         style = style.base_style
 
 
+# Шрифты из стандартного шаблона Word (например, «Заголовок 2») задаются
+# ссылкой на тему (asciiTheme/hAnsiTheme), а не явным именем: python-docx
+# возвращает для них None. Эти соответствия разрешают ссылку в имя шрифта.
+_THEME_KINDS = {
+    'majorHAnsi': 'major', 'majorAscii': 'major', 'majorBidi': 'major',
+    'minorHAnsi': 'minor', 'minorAscii': 'minor', 'minorBidi': 'minor',
+}
+
+
+def _font_theme_kind(font):
+    """'major'/'minor', если источник задаёт шрифт ссылкой на тему, иначе None."""
+    element = getattr(font, '_element', None)
+    if element is None:
+        return None
+    props = element.find(qn('w:rPr'))
+    if props is None:
+        return None
+    rfonts = props.find(qn('w:rFonts'))
+    if rfonts is None:
+        return None
+    for attribute in ('w:asciiTheme', 'w:hAnsiTheme', 'w:cstheme'):
+        kind = _THEME_KINDS.get(rfonts.get(qn(attribute)))
+        if kind:
+            return kind
+    return None
+
+
+def theme_fonts(paragraph):
+    """{'major': имя, 'minor': имя} из темы документа (word/theme/theme1.xml)."""
+    package = paragraph.part.package
+    cached = getattr(package, '_docxvalidator_theme_fonts', None)
+    if cached is not None:
+        return cached
+    fonts = {'major': None, 'minor': None}
+    try:
+        for rel in package.main_document_part.rels.values():
+            if rel.reltype.endswith('/theme'):
+                xml = rel.target_part.blob.decode('utf-8', 'ignore')
+                for kind, tag in (('major', 'a:majorFont'), ('minor', 'a:minorFont')):
+                    match = re.search(rf'<{tag}>.*?<a:latin typeface="([^"]*)"', xml, re.S)
+                    if match:
+                        fonts[kind] = match.group(1)
+                break
+    except Exception:
+        pass
+    package._docxvalidator_theme_fonts = fonts
+    return fonts
+
+
 def effective(paragraph, attr, run=None):
-    """Прямой формат, цепочки символьных/абзацных стилей и docDefaults."""
+    """Прямой формат, цепочки символьных/абзацных стилей, шрифты темы и docDefaults."""
     sources = [run.font] if run is not None else [paragraph.paragraph_format]
     if run is not None:
         sources.extend(s.font for s in style_chain(run.style))
     sources.extend((s.font if run is not None else s.paragraph_format)
                    for s in style_chain(paragraph.style))
+    resolve_theme = attr == 'name' and run is not None
     for source in sources:
         value = getattr(source, attr)
         if value is not None:
             return value
+        if resolve_theme:
+            kind = _font_theme_kind(source)
+            if kind:
+                name = theme_fonts(paragraph).get(kind)
+                if name:
+                    return name
     from docx.text.font import Font
     from docx.text.parfmt import ParagraphFormat
     defaults = paragraph.part.package.main_document_part.styles.element.find(qn('w:docDefaults'))
@@ -67,7 +123,13 @@ def effective(paragraph, attr, run=None):
             props = node.find(qn('w:rPr' if run is not None else 'w:pPr'))
             if props is not None:
                 wrapper.append(deepcopy(props))
-            return getattr(Font(wrapper) if run is not None else ParagraphFormat(wrapper), attr)
+            value = getattr(Font(wrapper) if run is not None else ParagraphFormat(wrapper), attr)
+            if value is not None:
+                return value
+            if resolve_theme:
+                kind = _font_theme_kind(Font(wrapper))
+                if kind:
+                    return theme_fonts(paragraph).get(kind)
     return None
 
 def field_instructions(container) -> List[str]:

@@ -8,8 +8,16 @@ from docx.oxml.ns import qn
 from typing import List
 
 from docx_rules.base import BaseRule, Severity, Violation
-from docx_rules.helpers import effective, style_chain, full_text, has_field
+from docx_rules.helpers import (effective, is_heading, is_word_heading, style_chain,
+                                full_text, has_field)
 from docx_rules.classification import classify_paragraphs
+
+
+def _display_char(text: str) -> str:
+    """Читаемое отображение маркера: служебные/непечатные символы как U+XXXX."""
+    if text and (ord(text[0]) < 32 or 0xE000 <= ord(text[0]) <= 0xF8FF):
+        return f'U+{ord(text[0]):04X}'
+    return text
 
 
 class ListsFormatRule(BaseRule):
@@ -20,6 +28,17 @@ class ListsFormatRule(BaseRule):
     INDENT_TOLERANCE_CM = 0.15
     # Для маркированного списка допустимо только среднее тире (U+2013).
     NUMBERING_DASHES = ('–',)
+
+    def __init__(self, auto_dash_indent_cm: float = 1.75, manual_indent_cm: float = 1.75,
+                 check_manual_items: bool = True):
+        # Отступ пунктов авто-списка: левый 0 см и «красная строка» на позиции
+        # маркера (в образце ТЗ тире стоит на красной строке 1,25 см, в МДК — 1,75).
+        self.auto_dash_indent_cm = auto_dash_indent_cm
+        self.manual_indent_cm = manual_indent_cm
+        # Ручные пункты («1. …», «– …», «1) …» набраны в тексте) проверяются не
+        # во всех профилях: в ТЗ по ГОСТ 34.602 одноуровневые «N. …» — это
+        # заголовки разделов, а не списки.
+        self.check_manual_items = check_manual_items
 
     @staticmethod
     def _item_kind(text: str):
@@ -43,6 +62,21 @@ class ListsFormatRule(BaseRule):
         if indent is None and paragraph.style and paragraph.style.paragraph_format:
             indent = paragraph.style.paragraph_format.first_line_indent
         return indent
+
+    # Случайные символы после двоеточия («задачи: `») не отменяют двоеточие
+    TRAILING_JUNK_REGEX = re.compile(r'[\s`*_…]+$')
+
+    @staticmethod
+    def _is_heading_paragraph(paragraph) -> bool:
+        """Заголовки (стили «Заголовок N»/outlineLvl) — не пункты списков.
+
+        Заголовки разделов часто получают автоматическую нумерацию через numId:
+        без этого фильтра такие «1.», «1.1.» проверялись бы как нумерованный список.
+        """
+        if any(re.match(r'^(?:Heading|Заголовок)\s*\d', st.name or '', re.I)
+               for st in style_chain(paragraph.style)):
+            return True
+        return bool(paragraph._p.xpath('./w:pPr/w:outlineLvl'))
 
     @staticmethod
     def _num_pr(paragraph):
@@ -125,6 +159,28 @@ class ListsFormatRule(BaseRule):
                         message=f"Маркер списка должен быть тире (–), а не '{lvl_text}'."
                     )
                 )
+            # Знак в конце пункта — как у ручных маркированных списков.
+            last_char = text[-1:]
+            if is_last:
+                if last_char not in ('.', ':'):
+                    violations.append(
+                        Violation(
+                            rule_name=rule_name,
+                            severity=Severity.WARNING,
+                            location=loc,
+                            message="В последнем пункте списка ставится точка."
+                        )
+                    )
+            elif last_char not in (';',):
+                violations.append(
+                    Violation(
+                        rule_name=rule_name,
+                        severity=Severity.WARNING,
+                        location=loc,
+                        message="Пункты маркированного списка заканчиваются точкой "
+                                "с запятой (кроме последнего)."
+                    )
+                )
         elif num_fmt == 'decimal':
             last_char = text[-1:]
             if lvl_text == '%1)':
@@ -140,7 +196,8 @@ class ListsFormatRule(BaseRule):
                         )
                     )
             elif lvl_text == '%1.':
-                if last_char != '.':
+                # Двоеточие допустимо: пункт может вводить вложенный список
+                if last_char not in ('.', ':'):
                     violations.append(
                         Violation(
                             rule_name=rule_name,
@@ -169,13 +226,15 @@ class ListsFormatRule(BaseRule):
                     first = Twips(int(first_val))
         left_cm = left.cm if left is not None else 0.0
         first_cm = first.cm if first is not None else 0.0
-        if abs(left_cm) > self.INDENT_TOLERANCE_CM or abs(first_cm - 1.75) > self.INDENT_TOLERANCE_CM:
+        if (abs(left_cm) > self.INDENT_TOLERANCE_CM
+                or abs(first_cm - self.auto_dash_indent_cm) > self.INDENT_TOLERANCE_CM):
             violations.append(
                 Violation(
                     rule_name=rule_name,
                     severity=Severity.WARNING,
                     location=loc,
-                    message=f"Отступ авто-списка: левый 0 см и красная строка 1.75 см "
+                    message=f"Отступ авто-списка: левый 0 см и красная строка "
+                            f"{self.auto_dash_indent_cm:g} см "
                             f"(фактически: левый {round(left_cm, 2)} см, красная строка {round(first_cm, 2)} см)."
                 )
             )
@@ -190,14 +249,14 @@ class ListsFormatRule(BaseRule):
             match = self.DOT_ITEM_REGEX.match(text)
             number = int(match.group(1))
             body = match.group(2)
-            expected_indent = 2.0 if number >= 10 else 1.75
+            expected_indent = self.manual_indent_cm + (0.25 if number >= 10 else 0)
         elif kind == 'bracket':
             match = self.BRACKET_ITEM_REGEX.match(text)
             body = match.group(2)
-            expected_indent = 1.75
+            expected_indent = self.manual_indent_cm
         else:
             body = self.DASH_ITEM_REGEX.match(text).group(2)
-            expected_indent = 1.75
+            expected_indent = self.manual_indent_cm
 
         # 1. Регистр первой буквы после маркера
         first_char = body[:1]
@@ -297,8 +356,12 @@ class ListsFormatRule(BaseRule):
             if not text:
                 continue
             # Список литературы и приложения не проверяются как списки
-            if re.match(r'^(СПИСОК\s+(ИСТОЧНИКОВ|ЛИТЕРАТУРЫ|ИСПОЛЬЗОВАННЫХ\s+ИСТОЧНИКОВ)|ПРИЛОЖЕНИЕ)', text.upper()):
+            if re.match(r'^СПИСОК\s+(ИСТОЧНИКОВ|ЛИТЕРАТУРЫ|ИСПОЛЬЗОВАННЫХ\s+ИСТОЧНИКОВ)', text.upper()):
                 break
+            if getattr(p, 'is_appendix', False) and re.match(r'^ПРИЛОЖЕНИЕ', text.upper()):
+                break
+            if self._is_heading_paragraph(p):
+                continue
             if is_centered(p):
                 continue
             num_pr = self._num_pr(p)
@@ -331,14 +394,21 @@ class ListsFormatRule(BaseRule):
             if (not has_prev_same and has_next_same and prev_item_idx >= 0
                     and prev_item_idx not in auto_map
                     and not self._item_kind(paragraphs[prev_item_idx].text.strip())):
-                prev_text = paragraphs[prev_item_idx].text.strip()
-                if not prev_text.endswith(':'):
+                prev_paragraph = paragraphs[prev_item_idx]
+                prev_text = prev_paragraph.text.strip()
+                # Заголовок раздела перед списком двоеточия не требует
+                if (self._is_heading_paragraph(prev_paragraph) or is_heading(prev_text)
+                        or is_word_heading(prev_text)):
+                    continue
+                if not self.TRAILING_JUNK_REGEX.sub('', prev_text).endswith(':'):
                     violations.append(Violation(
                         rule_name, Severity.WARNING,
                         f"Абзац {idx + 1} ('{paragraph.text.strip()[:30]}...')",
                         "В абзаце перед автоматическим списком ставится двоеточие."))
 
         for idx in sorted(item_indices):
+            if not self.check_manual_items:
+                break
             paragraph = paragraphs[idx]
             text = paragraph.text.strip()
             kind = self._item_kind(text)
@@ -360,8 +430,12 @@ class ListsFormatRule(BaseRule):
 
             # 4. Двоеточие в абзаце перед первым пунктом списка (из двух и более пунктов)
             if not has_prev_same and has_next_same and prev_item_idx >= 0:
-                prev_text = paragraphs[prev_item_idx].text.strip()
-                if not prev_text.endswith(':'):
+                prev_paragraph = paragraphs[prev_item_idx]
+                prev_text = prev_paragraph.text.strip()
+                if (self._is_heading_paragraph(prev_paragraph) or is_heading(prev_text)
+                        or is_word_heading(prev_text)):
+                    continue
+                if not self.TRAILING_JUNK_REGEX.sub('', prev_text).endswith(':'):
                     violations.append(
                         Violation(
                             rule_name=rule_name,
